@@ -1,0 +1,24 @@
+[package]
+name = "kohakuclip"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, memory-efficient, stateless video loader (Rust+pyo3+NumPy)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "kohakuclip_kclip"
+path = "src/kclip-rust/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module", "abi3", "abi3-py38"] }
+numpy = "0.27"
+ffmpeg-next = "8"
+thiserror = "2"
+tempfile = "3"
+once_cell = "1"
+
+[package.metadata.maturin]
+python-source = "src"
+module-name = "kohakuclip._kclip"
+bindings = "pyo3"
