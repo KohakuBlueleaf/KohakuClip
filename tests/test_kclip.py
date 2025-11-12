@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import io
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +98,23 @@ def test_metadata_for_path_and_bytes(synthetic_clip: SyntheticClip) -> None:
     assert meta_bytes.frame_count == meta.frame_count
     assert meta_bytes.width == meta.width
     assert meta_bytes.height == meta.height
+
+
+def test_apply_custom_function(synthetic_clip: SyntheticClip) -> None:
+    clip = KClip(synthetic_clip.path).apply(lambda frames: frames.astype(np.float32) / 255.0)
+    frames = clip.to_array()
+    assert frames.dtype == np.float32
+    assert frames.min() >= 0.0
+    assert frames.max() <= 1.0
+
+
+def test_apply_runs_after_native_ops(synthetic_clip: SyntheticClip) -> None:
+    base = KClip(synthetic_clip.path).range(0, 4).resize(16, 16)
+    applied = base.apply(lambda frames: frames.astype(np.int16) + 1)
+
+    base_frames = base.to_array().astype(np.int16) + 1
+    applied_frames = applied.to_array()
+    np.testing.assert_array_equal(applied_frames, base_frames)
 
 
 def _generate_frames(num_frames: int, size: int, square: int) -> np.ndarray:
