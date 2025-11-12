@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -6,7 +7,8 @@ use once_cell::sync::OnceCell;
 use tempfile::NamedTempFile;
 
 use crate::core::types::{
-    FrameRange, LoadOptions, ResizeFilter, ResizeOptions, VideoBatch, VideoError, VideoResult,
+    FrameRange, LoadOptions, ResizeFilter, ResizeOptions, VideoBatch, VideoError, VideoMetadata,
+    VideoResult,
 };
 
 static FFMPEG_INIT: OnceCell<()> = OnceCell::new();
@@ -120,6 +122,26 @@ fn decode_frames(
         height: target_height as usize,
         channels,
     })
+}
+
+pub fn inspect_video_from_path(path: &Path) -> VideoResult<VideoMetadata> {
+    ensure_ffmpeg()?;
+
+    let file_size = fs::metadata(path)?.len();
+    let mut ictx = ffmpeg::format::input(path)?;
+    extract_video_metadata(&mut ictx, file_size)
+}
+
+pub fn inspect_video_from_bytes(bytes: &[u8]) -> VideoResult<VideoMetadata> {
+    ensure_ffmpeg()?;
+
+    let mut tempfile = NamedTempFile::new()?;
+    tempfile.write_all(bytes)?;
+    tempfile.flush()?;
+
+    let file_size = bytes.len() as u64;
+    let mut ictx = ffmpeg::format::input(tempfile.path())?;
+    extract_video_metadata(&mut ictx, file_size)
 }
 
 struct DrainResult {
@@ -243,4 +265,122 @@ enum RangeAction {
     Skip,
     Take,
     Stop,
+}
+
+fn extract_video_metadata(
+    ictx: &mut ffmpeg::format::context::Input,
+    file_size: u64,
+) -> VideoResult<VideoMetadata> {
+    let stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or(VideoError::StreamNotFound)?;
+
+    let parameters = stream.parameters();
+    let (width, height) = read_dimensions(&parameters)?;
+    let bit_rate = read_bit_rate(&parameters, ictx);
+    let frame_count = estimate_frame_count(&stream, ictx.duration());
+    let format_label = describe_format(ictx);
+
+    Ok(VideoMetadata { format: format_label, file_size, frame_count, width, height, bit_rate })
+}
+
+fn read_dimensions(parameters: &ffmpeg::codec::Parameters) -> VideoResult<(u32, u32)> {
+    unsafe {
+        let width = (*parameters.as_ptr()).width;
+        let height = (*parameters.as_ptr()).height;
+        if width <= 0 || height <= 0 {
+            return Err(VideoError::Metadata(
+                "source reported non-positive dimensions".to_string(),
+            ));
+        }
+        Ok((width as u32, height as u32))
+    }
+}
+
+fn read_bit_rate(
+    parameters: &ffmpeg::codec::Parameters,
+    ictx: &ffmpeg::format::context::Input,
+) -> Option<u64> {
+    unsafe {
+        let value = (*parameters.as_ptr()).bit_rate;
+        if value > 0 {
+            return Some(value as u64);
+        }
+    }
+    let ctx_rate = ictx.bit_rate();
+    if ctx_rate > 0 {
+        Some(ctx_rate as u64)
+    } else {
+        None
+    }
+}
+
+fn describe_format(ictx: &ffmpeg::format::context::Input) -> String {
+    let input = ictx.format();
+    let description = input.description().trim();
+    if description.is_empty() {
+        input.name().to_string()
+    } else {
+        description.to_string()
+    }
+}
+
+fn estimate_frame_count(stream: &ffmpeg::Stream, container_duration: i64) -> Option<u64> {
+    let nb_frames = stream.frames();
+    if nb_frames > 0 {
+        return Some(nb_frames as u64);
+    }
+
+    let fps = rational_to_positive_f64(stream.avg_frame_rate())
+        .or_else(|| rational_to_positive_f64(stream.rate()))?;
+
+    if let Some(seconds) = stream_duration_seconds(stream) {
+        if let Some(count) = frames_from_seconds(seconds, fps) {
+            return Some(count);
+        }
+    }
+
+    if container_duration > 0 && container_duration != ffmpeg::ffi::AV_NOPTS_VALUE {
+        let seconds = container_duration as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        return frames_from_seconds(seconds, fps);
+    }
+
+    None
+}
+
+fn stream_duration_seconds(stream: &ffmpeg::Stream) -> Option<f64> {
+    let duration = stream.duration();
+    if duration <= 0 || duration == ffmpeg::ffi::AV_NOPTS_VALUE {
+        return None;
+    }
+    let time_base = rational_to_positive_f64(stream.time_base())?;
+    let seconds = (duration as f64) * time_base;
+    if seconds > 0.0 {
+        Some(seconds)
+    } else {
+        None
+    }
+}
+
+fn rational_to_positive_f64(value: ffmpeg::Rational) -> Option<f64> {
+    let num = value.numerator();
+    let den = value.denominator();
+    if num <= 0 || den <= 0 {
+        None
+    } else {
+        Some(num as f64 / den as f64)
+    }
+}
+
+fn frames_from_seconds(seconds: f64, fps: f64) -> Option<u64> {
+    if seconds <= 0.0 || !seconds.is_finite() || fps <= 0.0 || !fps.is_finite() {
+        return None;
+    }
+    let frames = (seconds * fps).round();
+    if frames.is_finite() && frames > 0.0 {
+        Some(frames as u64)
+    } else {
+        None
+    }
 }

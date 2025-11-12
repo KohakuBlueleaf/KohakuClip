@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from os import PathLike as _PathLike
 from pathlib import Path
-from typing import Literal, Tuple, Union
+from typing import Any, Literal, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -13,6 +13,8 @@ from numpy.typing import NDArray
 from ._kclip import (
     load_numpy_frames_from_bytes as _rust_load_bytes,
     load_numpy_frames_from_path as _rust_load_path,
+    load_video_metadata_from_bytes as _rust_meta_bytes,
+    load_video_metadata_from_path as _rust_meta_path,
 )
 
 PathLike = Union[str, _PathLike[str], Path]
@@ -46,13 +48,40 @@ class _PostOp:
     params: Tuple[int | None, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class VideoMetadata:
+    """Lightweight container describing a video source."""
+
+    file_size: int
+    format: str
+    width: int
+    height: int
+    frame_count: int | None
+    bit_rate: int | None
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "file_size": self.file_size,
+            "format": self.format,
+            "width": self.width,
+            "height": self.height,
+            "frame_count": self.frame_count,
+            "bit_rate": self.bit_rate,
+            "resolution": self.resolution,
+        }
+
+
 _MISSING = object()
 
 
 class KClip:
     """Stateless video loading pipeline."""
 
-    __slots__ = ("_source", "_frame_range", "_resize", "_post_ops")
+    __slots__ = ("_source", "_frame_range", "_resize", "_post_ops", "_metadata")
 
     def __init__(
         self,
@@ -61,11 +90,13 @@ class KClip:
         frame_range: slice | None = None,
         resize: tuple[int, int] | None = None,
         _post_ops: Tuple[_PostOp, ...] | None = None,
+        _metadata: VideoMetadata | None = None,
     ) -> None:
         self._source = _VideoSource.normalize(source)
         self._frame_range = frame_range
         self._resize = resize
         self._post_ops = _post_ops or ()
+        self._metadata = _metadata
 
     def range(
         self,
@@ -155,10 +186,30 @@ class KClip:
             tensor = tensor.to(device=device)
         return tensor
 
+    def meta(self) -> VideoMetadata:
+        """Return metadata for the underlying video source."""
+
+        if self._metadata is None:
+            raw = self._load_metadata()
+            self._metadata = VideoMetadata(
+                file_size=int(raw["file_size"]),
+                format=str(raw["format"]),
+                width=int(raw["width"]),
+                height=int(raw["height"]),
+                frame_count=(int(raw["frame_count"]) if raw["frame_count"] is not None else None),
+                bit_rate=(int(raw["bit_rate"]) if raw["bit_rate"] is not None else None),
+            )
+        return self._metadata
+
     def _load_native(self) -> FrameArray:
         if self._source.kind == "path":
             return _rust_load_path(self._source.value, self._frame_range, self._resize)
         return _rust_load_bytes(self._source.value, self._frame_range, self._resize)
+
+    def _load_metadata(self) -> dict[str, Any]:
+        if self._source.kind == "path":
+            return _rust_meta_path(self._source.value)
+        return _rust_meta_bytes(self._source.value)
 
     def _apply_post(self, frames: FrameArray) -> FrameArray:
         if not self._post_ops:
@@ -182,15 +233,18 @@ class KClip:
         frame_range: slice | None | object = _MISSING,
         resize: tuple[int, int] | None | object = _MISSING,
         post_ops: Tuple[_PostOp, ...] | None | object = _MISSING,
+        metadata: VideoMetadata | None | object = _MISSING,
     ) -> "KClip":
         frame_range_value = self._frame_range if frame_range is _MISSING else frame_range
         resize_value = self._resize if resize is _MISSING else resize
         post_ops_value = self._post_ops if post_ops is _MISSING else post_ops
+        metadata_value = self._metadata if metadata is _MISSING else metadata
         return self.__class__(
             self._source,
             frame_range=frame_range_value,
             resize=resize_value,
             _post_ops=post_ops_value,
+            _metadata=metadata_value,
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
@@ -257,6 +311,7 @@ __all__ = [
     "FrameArray",
     "PathLike",
     "KClip",
+    "VideoMetadata",
     "load_frames",
     "load_frames_from_bytes",
 ]

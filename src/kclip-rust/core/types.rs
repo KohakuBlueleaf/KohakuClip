@@ -24,6 +24,9 @@ pub enum VideoError {
 
     #[error("invalid resize parameters: {0}")]
     InvalidResize(String),
+
+    #[error("metadata unavailable: {0}")]
+    Metadata(String),
 }
 
 #[derive(Debug, Clone)]
@@ -97,4 +100,14 @@ impl ResizeOptions {
 pub struct LoadOptions {
     pub frame_range: FrameRange,
     pub resize: Option<ResizeOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoMetadata {
+    pub format: String,
+    pub file_size: u64,
+    pub frame_count: Option<u64>,
+    pub width: u32,
+    pub height: u32,
+    pub bit_rate: Option<u64>,
 }

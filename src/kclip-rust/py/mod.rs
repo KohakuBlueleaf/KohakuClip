@@ -4,12 +4,13 @@ use std::path::Path;
 use numpy::{PyArray1, PyArray4, PyArrayMethods};
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PySlice;
+use pyo3::types::{PyDict, PySlice};
 use pyo3::wrap_pyfunction;
 
 use crate::core::{
-    load_frames_from_bytes, load_frames_from_path, FrameRange, LoadOptions, ResizeOptions,
-    VideoBatch, VideoError,
+    inspect_video_from_bytes, inspect_video_from_path, load_frames_from_bytes,
+    load_frames_from_path, FrameRange, LoadOptions, ResizeOptions, VideoBatch, VideoError,
+    VideoMetadata,
 };
 
 #[pyfunction]
@@ -36,6 +37,18 @@ fn load_numpy_frames_from_bytes(
     let options = build_load_options(frame_range, resize)?;
     let batch = load_frames_from_bytes(data, options)?;
     batch_to_numpy(py, batch)
+}
+
+#[pyfunction]
+fn load_video_metadata_from_path(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
+    let metadata = inspect_video_from_path(Path::new(path))?;
+    metadata_to_py(py, metadata)
+}
+
+#[pyfunction]
+fn load_video_metadata_from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyDict>> {
+    let metadata = inspect_video_from_bytes(data)?;
+    metadata_to_py(py, metadata)
 }
 
 fn batch_to_numpy(py: Python<'_>, batch: VideoBatch) -> PyResult<Py<PyArray4<u8>>> {
@@ -110,6 +123,17 @@ fn ensure_non_negative(value: isize, label: &str) -> PyResult<usize> {
     }
 }
 
+fn metadata_to_py(py: Python<'_>, metadata: VideoMetadata) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("file_size", metadata.file_size)?;
+    dict.set_item("format", metadata.format)?;
+    dict.set_item("width", metadata.width)?;
+    dict.set_item("height", metadata.height)?;
+    dict.set_item("frame_count", metadata.frame_count)?;
+    dict.set_item("bit_rate", metadata.bit_rate)?;
+    Ok(dict.into())
+}
+
 impl From<VideoError> for PyErr {
     fn from(value: VideoError) -> Self {
         match value {
@@ -121,6 +145,7 @@ impl From<VideoError> for PyErr {
             VideoError::InvalidRange(_) | VideoError::InvalidResize(_) => {
                 PyValueError::new_err(value.to_string())
             }
+            VideoError::Metadata(_) => PyRuntimeError::new_err(value.to_string()),
         }
     }
 }
@@ -129,5 +154,7 @@ impl From<VideoError> for PyErr {
 fn _kclip(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_numpy_frames_from_path, m)?)?;
     m.add_function(wrap_pyfunction!(load_numpy_frames_from_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(load_video_metadata_from_path, m)?)?;
+    m.add_function(wrap_pyfunction!(load_video_metadata_from_bytes, m)?)?;
     Ok(())
 }
