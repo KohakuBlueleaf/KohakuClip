@@ -1,11 +1,9 @@
 """Implementation of the public KohakuClip Python API."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from os import PathLike as _PathLike
 from pathlib import Path
-from typing import Any, Literal, Tuple, Union
+from typing import Any, Callable, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,19 +15,19 @@ from ._kclip import (
     load_video_metadata_from_path as _rust_meta_path,
 )
 
-PathLike = Union[str, _PathLike[str], Path]
+PathLike = str | _PathLike[str] | Path
 FrameArray = NDArray[np.uint8]
 
 
 @dataclass(frozen=True, slots=True)
 class _VideoSource:
     kind: Literal["path", "bytes"]
-    value: Union[str, bytes]
+    value: str | bytes
 
     @classmethod
     def normalize(
         cls,
-        source: Union[PathLike, bytes, bytearray, memoryview, "_VideoSource"],
+        source: "PathLike | bytes | bytearray | memoryview | _VideoSource",
     ) -> "_VideoSource":
         if isinstance(source, cls):
             return source
@@ -44,8 +42,8 @@ class _VideoSource:
 
 @dataclass(frozen=True, slots=True)
 class _PostOp:
-    kind: Literal["crop", "numpy_resize"]
-    params: Tuple[int | None, ...]
+    kind: Literal["crop", "numpy_resize", "callable"]
+    params: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +83,11 @@ class KClip:
 
     def __init__(
         self,
-        source: Union[PathLike, bytes, bytearray, memoryview, _VideoSource],
+        source: PathLike | bytes | bytearray | memoryview | _VideoSource,
         *,
         frame_range: slice | None = None,
         resize: tuple[int, int] | None = None,
-        _post_ops: Tuple[_PostOp, ...] | None = None,
+        _post_ops: tuple[_PostOp, ...] | None = None,
         _metadata: VideoMetadata | None = None,
     ) -> None:
         self._source = _VideoSource.normalize(source)
@@ -186,6 +184,14 @@ class KClip:
             tensor = tensor.to(device=device)
         return tensor
 
+    def apply(self, func: Callable[[np.ndarray], np.ndarray]) -> "KClip":
+        """Append a custom NumPy transformation executed after built-in post ops."""
+
+        if not callable(func):
+            raise TypeError("func must be callable")
+        op = _PostOp("callable", (func,))
+        return self._replace(post_ops=self._post_ops + (op,))
+
     def meta(self) -> VideoMetadata:
         """Return metadata for the underlying video source."""
 
@@ -223,6 +229,10 @@ class KClip:
             elif op.kind == "numpy_resize":
                 height, width = op.params
                 result = _resize_numpy(result, height, width)
+            elif op.kind == "callable":
+                (func,) = op.params
+                produced = func(result)
+                result = _ensure_frame_array(produced)
             else:  # pragma: no cover - defensive
                 raise RuntimeError(f"Unknown post operation: {op.kind}")
         return result
@@ -232,7 +242,7 @@ class KClip:
         *,
         frame_range: slice | None | object = _MISSING,
         resize: tuple[int, int] | None | object = _MISSING,
-        post_ops: Tuple[_PostOp, ...] | None | object = _MISSING,
+        post_ops: tuple[_PostOp, ...] | None | object = _MISSING,
         metadata: VideoMetadata | None | object = _MISSING,
     ) -> "KClip":
         frame_range_value = self._frame_range if frame_range is _MISSING else frame_range
@@ -255,7 +265,7 @@ class KClip:
 
     def __getstate__(
         self,
-    ) -> Tuple[_VideoSource, slice | None, tuple[int, int] | None, Tuple[_PostOp, ...]]:
+    ) -> tuple[_VideoSource, slice | None, tuple[int, int] | None, tuple[_PostOp, ...]]:
         return (self._source, self._frame_range, self._resize, self._post_ops)
 
     def __setstate__(self, state) -> None:
@@ -273,6 +283,15 @@ def load_frames_from_bytes(data: bytes) -> FrameArray:
     """Load frames from raw video bytes."""
 
     return KClip(data).to_array()
+
+
+def _ensure_frame_array(value: np.ndarray | Any) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim != 4:
+        raise ValueError(
+            "Custom post-processing functions must return an array shaped (frames, height, width, channels)"
+        )
+    return array
 
 
 def _resize_numpy(frames: FrameArray, height: int, width: int) -> FrameArray:

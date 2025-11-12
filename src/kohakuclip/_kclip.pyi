@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from typing import TypedDict, Tuple
+from typing import TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,12 +16,12 @@ class VideoMetadataDict(TypedDict):
 def load_numpy_frames_from_path(
     path: str,
     frame_range: slice | None = ...,
-    resize: Tuple[int, int] | None = ...,
+    resize: tuple[int, int] | None = ...,
 ) -> FrameArray: ...
 def load_numpy_frames_from_bytes(
     data: bytes,
     frame_range: slice | None = ...,
-    resize: Tuple[int, int] | None = ...,
+    resize: tuple[int, int] | None = ...,
 ) -> FrameArray: ...
 def load_video_metadata_from_path(path: str) -> VideoMetadataDict: ...
 def load_video_metadata_from_bytes(data: bytes) -> VideoMetadataDict: ...
