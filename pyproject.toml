@@ -7,7 +7,7 @@ name = "kohakuclip"
 version = "0.1.0"
 description = "Fast, memory-efficient, stateless video loader (Rust+pyo3+NumPy)"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Kohaku" }]
 dependencies = [
@@ -31,16 +31,20 @@ classifiers = [
 dev = [
     "maturin[patchelf]>=1.0,<2.0",
     "black>=25.0.0",
-    "pytest>=8.2.0",
+    "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
-    "av>=11.0.0",
+    "av>=16.0.0",
     "torch>=2.3.0",
+    "psutil>=6.0.0",
+    "tqdm>=4.66.0",
 ]
 test = [
-    "pytest>=8.2.0",
+    "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
-    "av>=11.0.0",
+    "av>=16.0.0",
     "torch>=2.3.0",
+    "psutil>=6.0.0",
+    "tqdm>=4.66.0",
 ]
 
 [tool.maturin]
