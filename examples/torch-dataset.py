@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Demonstrate loading MP4 folders with KohakuClip + PyTorch."""
 
-from __future__ import annotations
-
 import argparse
 import random
 import sys

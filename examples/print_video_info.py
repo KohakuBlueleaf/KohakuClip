@@ -6,8 +6,6 @@ Usage:
     python examples/print_video_info.py /path/to/video.mp4
 """
 
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 from typing import Iterable

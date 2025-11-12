@@ -1,7 +1,5 @@
 """Reusable PyTorch dataset utilities built on top of KohakuClip."""
 
-from __future__ import annotations
-
 import random
 from pathlib import Path
 from typing import Callable
@@ -41,41 +39,42 @@ class FolderVideoDataset(Dataset):
         self.max_attempts = max_attempts
         self.dtype = dtype
         self._rng = random.Random(seed)
-        self._metadata_cache: dict[str, VideoMetadata] = {}
         self.files = self._collect_video_files()
-        if not self.files:
+        if self.files.size == 0:
             raise ValueError(f"No MP4 files found under {self.folder_path}")
 
-    def _collect_video_files(self) -> list[str]:
+    def _collect_video_files(self) -> np.ndarray:
         cache_path = self.folder_path / self.cache_name
         if cache_path.exists():
-            files = np.load(cache_path, allow_pickle=True).tolist()
-            return [str(Path(p)) for p in files]
+            return np.load(cache_path, allow_pickle=True)
 
-        files = sorted(str(path) for path in self.folder_path.rglob("*.mp4") if path.is_file())
-        np.save(cache_path, np.array(files, dtype=object))
+        files = np.array(
+            sorted(str(path) for path in self.folder_path.rglob("*.mp4") if path.is_file()),
+            dtype=object,
+        )
+        np.save(cache_path, files)
         return files
 
     def __len__(self) -> int:
-        return len(self.files)
+        return int(self.files.size)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        if not self.files:
+        if self.files.size == 0:
             raise RuntimeError("Dataset is empty")
 
         attempts = 0
-        index = idx % len(self.files)
+        index = idx % self.files.size
         while attempts < self.max_attempts:
             file_path = Path(self.files[index])
             try:
                 return self._load_clip(file_path)
             except Exception:
                 attempts += 1
-                index = self._rng.randint(0, len(self.files) - 1)
+                index = self._rng.randint(0, self.files.size - 1)
         raise RuntimeError(f"Failed to load video after {self.max_attempts} attempts")
 
     def metadata(self, idx: int) -> VideoMetadata:
-        file_path = Path(self.files[idx % len(self.files)])
+        file_path = Path(self.files[idx % self.files.size])
         return self._metadata_for(file_path)
 
     def _load_clip(self, file_path: Path) -> torch.Tensor:
@@ -102,12 +101,8 @@ class FolderVideoDataset(Dataset):
         return tensor
 
     def _metadata_for(self, file_path: Path, clip: KClip | None = None) -> VideoMetadata:
-        key = str(file_path)
-        if key in self._metadata_cache:
-            return self._metadata_cache[key]
         clip = clip or KClip(file_path)
         meta = clip.meta()
-        self._metadata_cache[key] = meta
         return meta
 
     def _probe_frame_count(self, file_path: Path) -> int | None:

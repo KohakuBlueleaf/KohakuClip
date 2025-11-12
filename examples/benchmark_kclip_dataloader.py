@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Generate a synthetic video corpus and benchmark KohakuClip + PyTorch DataLoader."""
 
-from __future__ import annotations
-
 import argparse
 import csv
 import math

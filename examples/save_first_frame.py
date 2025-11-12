@@ -8,8 +8,6 @@ Usage:
 Requires Pillow (pip install pillow).
 """
 
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
