@@ -16,6 +16,11 @@ static FFMPEG_INIT: OnceCell<()> = OnceCell::new();
 fn ensure_ffmpeg() -> VideoResult<()> {
     FFMPEG_INIT.get_or_try_init(|| {
         ffmpeg::init()?;
+        // Suppress noisy warnings like "deprecated pixel format used"
+        // from swscaler when handling MJPEG and other formats
+        unsafe {
+            ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_ERROR as i32);
+        }
         Ok::<(), ffmpeg::Error>(())
     })?;
     Ok(())

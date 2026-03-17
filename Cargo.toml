@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3", "abi3-py310"] }
 numpy = "0.27"
-ffmpeg-next = "8"
+ffmpeg-next = { version = "8", features = ["build"] }
 thiserror = "2"
 tempfile = "3"
 once_cell = "1"
