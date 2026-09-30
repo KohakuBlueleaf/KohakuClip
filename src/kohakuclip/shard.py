@@ -1,10 +1,11 @@
-"""Shards: zip archives (stored, no compression) of faststart mp4 files, plus an optional index member.
+"""Sources of videos: zip or tar archives (stored, uncompressed) of faststart mp4 files, or a folder
+tree of mp4 files. One ``Shard`` per archive or folder.
 
-The index (``__index__.bin``, written by ``kohakuclip.writer``) holds, per video, the absolute byte
-offset, size and flags of every frame, so a clip is read with one pread per GOP. It is memory-mapped
-straight from the zip: the OS page cache shares it between workers and nothing extra is stored.
-Without it, each video's frame table is parsed from its own ``moov`` box (faststart puts it at the
-front) on first use and cached: one extra small read per video.
+An archive may carry an index member (``__index__.bin``, written by ``kohakuclip.writer``) holding,
+per video, the absolute byte offset, size and flags of every frame, so a clip is read with one pread
+per GOP. It is memory-mapped straight from the archive: the OS page cache shares it between workers
+and nothing extra is stored. Without it (and always for folders), each video's frame table is parsed
+from its own ``moov`` box (faststart puts it at the front) on first use and cached.
 
 Index layout: b"KCIDX1\\0\\0" | u64 json length | json | pad to 8 | frame records (``FRAME``).
 """
@@ -13,9 +14,12 @@ import json
 import mmap
 import os
 import struct
+import tarfile
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 
@@ -34,12 +38,20 @@ class Video:
     h: int
     w: int
     codec: str            # "av1" | "h264" | "hevc"
-    off: np.ndarray       # [n] absolute byte offset of each frame in the shard
+    off: np.ndarray       # [n] absolute byte offset of each frame in its file
     size: np.ndarray      # [n] bytes
     keys: np.ndarray      # sorted keyframe indices
     keep: np.ndarray | None = None  # [n] bytes to decode when the frame is not wanted (None: all)
     prefix: bytes = b""   # prepended to each GOP's first packet (see ``codec_prefix``)
     colorspace: str = "bt709"
+
+
+@dataclass
+class Member:
+    name: str
+    path: str        # the file holding the mp4 bytes: the archive, or the mp4 itself
+    start: int       # offset of the mp4's first byte in that file (zip: -1, read from its local header)
+    header: int = 0  # zip: local header offset
 
 
 def data_offset(f, header_offset: int) -> int:
@@ -51,23 +63,48 @@ def data_offset(f, header_offset: int) -> int:
 
 
 class Shard:
-    def __init__(self, path: str, moov_cache: int = 4096):
-        self.path = path
-        self.fd = os.open(path, os.O_RDONLY)
-        with zipfile.ZipFile(path) as z:
-            infos = z.infolist()
-        self.members = [(i.filename, i.header_offset) for i in infos if i.filename != INDEX]
-        index = next((i for i in infos if i.filename == INDEX), None)
+    """The videos of one zip / tar archive or folder tree, in a fixed order."""
+
+    def __init__(self, path: str, moov_cache: int = 4096, open_files: int = 4096):
+        self.path = str(path)
+        self._fds: OrderedDict[str, int] = OrderedDict()
+        self.open_files = open_files  # folders: at most this many mp4 files kept open
+        index = None
+        if os.path.isdir(self.path):
+            files = sorted(str(p) for p in Path(self.path).rglob("*.mp4"))
+            self.members = [Member(os.path.relpath(f, self.path), f, 0) for f in files]
+        elif tarfile.is_tarfile(self.path):
+            with tarfile.open(self.path) as t:
+                infos = [m for m in t.getmembers() if m.isfile()]
+            self.members = [Member(m.name, self.path, m.offset_data) for m in infos if m.name != INDEX]
+            index = next((m.offset_data for m in infos if m.name == INDEX), None)
+        else:
+            with zipfile.ZipFile(self.path) as z:
+                infos = z.infolist()
+            self.members = [Member(i.filename, self.path, -1, i.header_offset) for i in infos if i.filename != INDEX]
+            idx = next((i for i in infos if i.filename == INDEX), None)
+            if idx is not None:
+                with open(self.path, "rb") as f:
+                    index = data_offset(f, idx.header_offset)
         self.meta, self.frames = self._open_index(index) if index is not None else (None, None)
         self._moov = lru_cache(maxsize=moov_cache)(self._parse_moov)
 
     def __len__(self) -> int:
         return len(self.members)
 
-    def _open_index(self, info):
-        with open(self.path, "rb") as f:
-            start = data_offset(f, info.header_offset)
-        mm = mmap.mmap(self.fd, 0, prot=mmap.PROT_READ)
+    def fd(self, i: int) -> int:
+        """File descriptor holding video ``i`` (opened lazily; least recently used ones closed)."""
+        path = self.members[i].path
+        fd = self._fds.pop(path, None)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            if len(self._fds) >= self.open_files:
+                os.close(self._fds.popitem(last=False)[1])
+        self._fds[path] = fd
+        return fd
+
+    def _open_index(self, start: int):
+        mm = mmap.mmap(self.fd(0), 0, prot=mmap.PROT_READ)
         if mm[start:start + 8] != MAGIC:
             raise ValueError(f"{self.path}: bad index magic")
         jlen = struct.unpack("<Q", mm[start + 8:start + 16])[0]
@@ -87,18 +124,20 @@ class Shard:
                      bytes.fromhex(m.get("prefix", "")), m.get("colorspace", "bt709"))
 
     def _parse_moov(self, i: int) -> Video:
-        _, header_offset = self.members[i]
-        buf = os.pread(self.fd, 64 * 1024, header_offset)
-        base = 30 + sum(struct.unpack("<HH", buf[26:30]))
-        pos = base
+        m = self.members[i]
+        fd = self.fd(i)
+        at = m.header if m.start < 0 else m.start
+        buf = os.pread(fd, 64 * 1024, at)
+        pos = 30 + sum(struct.unpack("<HH", buf[26:30])) if m.start < 0 else 0  # skip the zip local header
+        base = at + pos
         while True:  # ftyp, then moov (faststart); read the whole moov if it is larger
             size, typ = struct.unpack(">I4s", buf[pos:pos + 8])
             if typ == b"moov":
                 if pos + size > len(buf):
-                    buf = os.pread(self.fd, pos + size, header_offset)
-                return parse_moov(memoryview(buf)[pos:pos + size], header_offset + base)
+                    buf = os.pread(fd, pos + size, at)
+                return parse_moov(memoryview(buf)[pos:pos + size], base)
             if typ == b"mdat":
-                raise ValueError(f"{self.path}:{self.members[i][0]} is not faststart (moov after mdat)")
+                raise ValueError(f"{self.path}:{m.name} is not faststart (moov after mdat)")
             pos += size
 
 

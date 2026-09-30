@@ -42,7 +42,12 @@ how many bytes later frames depend on: SVT-AV1 puts half of all frames in a top 
 references, so unwanted samples are decoded only up to their last referenced frame (25 % of
 samples are dropped entirely, 25 % truncated), bit-exactly.
 
-Shard layout: `shard_XXXXX.zip` = the mp4 files + `__index__.bin` (per frame: absolute byte
+Sources: a `Reader` takes any mix of zip archives (stored), uncompressed tar archives and folder
+trees (every `*.mp4` below them, recursively). Archives written by `kohakuclip-write`
+(`--container zip|tar`) carry an index member; archives without one, and folders, fall back to
+parsing each mp4's `moov` box on first use (all return the same clips; see `tests`).
+
+Shard layout: `shard_XXXXX.zip` (or `.tar`) = the mp4 files + `__index__.bin` (per frame: absolute byte
 offset, size, bytes later frames depend on, keyframe flag; per video: fps, size, codec, decoder
 prefix). The index
 is memory-mapped from the zip (shared by all workers through the page cache). Without it, each

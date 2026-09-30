@@ -90,7 +90,8 @@ class Reader:
         for b, ((vid, frames), v) in enumerate(zip(items, infos)):
             want, inverse = np.unique(np.asarray(frames, np.int32), return_inverse=True)
             target = out[b] if len(want) == t else np.empty((len(want),) + out.shape[2:], np.uint8)
-            r, arrays = self._plan(v, self.videos[vid][0].fd, want, target, side if yuv else None)
+            shard, i = self.videos[vid]
+            r, arrays = self._plan(v, shard.fd(i), want, target, side if yuv else None)
             reqs.append(r)
             keep.append(arrays)
             dups.append(None if len(want) == t else (b, target, inverse))

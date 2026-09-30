@@ -4,15 +4,17 @@
 
 Storage format (defaults, see README for the measurements behind them): native fps, short side
 capped at 512 (never upscaled), closed GOP of 16, AV1 (SVT-AV1 preset 6) with the in-loop filters
-(deblocking, CDEF, loop restoration) off for faster decoding, faststart mp4, zip in stored mode.
+(deblocking, CDEF, loop restoration) off for faster decoding, faststart mp4, zip (stored) or tar.
 Encoding uses the ffmpeg CLI (with libsvtav1 / libx264); reading back uses PyAV (write time only).
 """
 
 import argparse
+import io
 import json
 import os
 import struct
 import subprocess
+import tarfile
 import tempfile
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
@@ -78,23 +80,39 @@ def frame_table(path: str) -> tuple[list, dict]:
     return rows, meta
 
 
-def pack(mp4s: list[str], zip_path: str) -> None:
-    """Zip (stored) the mp4 files, then append the index member with absolute frame offsets."""
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
-        for p in mp4s:
-            z.write(p, os.path.basename(p))
+def pack(mp4s: list[str], path: str) -> None:
+    """Archive the mp4 files (``.tar``, or zip in stored mode), then append the index member with the
+    absolute offset of every frame in the archive."""
+    names = [os.path.basename(p) for p in mp4s]
+    if path.endswith(".tar"):
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as t:
+            for p, n in zip(mp4s, names):
+                t.add(p, n)
+        with tarfile.open(path) as t:
+            starts = [t.getmember(n).offset_data for n in names]
+    else:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as z:
+            for p, n in zip(mp4s, names):
+                z.write(p, n)
+        with zipfile.ZipFile(path) as z, open(path, "rb") as f:
+            starts = [data_offset(f, z.getinfo(n).header_offset) for n in names]
     videos, records = [], []
-    with zipfile.ZipFile(zip_path) as z, open(zip_path, "rb") as f:
-        for info, p in zip(z.infolist(), mp4s):
-            base = data_offset(f, info.header_offset)
-            rows, meta = frame_table(p)
-            videos.append(dict(member=info.filename, row=len(records), **meta))
-            records += [(base + off, size, keep, flags, (0,) * 7) for off, size, keep, flags in rows]
+    for p, n, base in zip(mp4s, names, starts):
+        rows, meta = frame_table(p)
+        videos.append(dict(member=n, row=len(records), **meta))
+        records += [(base + off, size, keep, flags, (0,) * 7) for off, size, keep, flags in rows]
     meta = json.dumps(dict(videos=videos)).encode()
     head = MAGIC + struct.pack("<Q", len(meta)) + meta
     head += b"\0" * (-len(head) % 8)
-    with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_STORED) as z:
-        z.writestr(zipfile.ZipInfo(INDEX), head + np.array(records, FRAME).tobytes())
+    blob = head + np.array(records, FRAME).tobytes()
+    if path.endswith(".tar"):
+        with tarfile.open(path, "a", format=tarfile.PAX_FORMAT) as t:
+            info = tarfile.TarInfo(INDEX)
+            info.size = len(blob)
+            t.addfile(info, io.BytesIO(blob))
+    else:
+        with zipfile.ZipFile(path, "a", zipfile.ZIP_STORED) as z:
+            z.writestr(zipfile.ZipInfo(INDEX), blob)
 
 
 def _encode_one(args):
@@ -107,15 +125,15 @@ def _encode_one(args):
 
 
 def write(sources: list[str], out_dir: str, enc: Encoding = Encoding(), per_shard: int = 1000,
-          workers: int = os.cpu_count() or 1) -> list[str]:
-    """Encode ``sources`` in parallel and pack them into ``out_dir/shard_XXXXX.zip``."""
+          workers: int = os.cpu_count() or 1, container: str = "zip") -> list[str]:
+    """Encode ``sources`` in parallel and pack them into ``out_dir/shard_XXXXX.{zip,tar}``."""
     os.makedirs(out_dir, exist_ok=True)
     shards = []
     with tempfile.TemporaryDirectory(dir=out_dir) as tmp, ProcessPoolExecutor(workers) as pool:
         for k in range(0, len(sources), per_shard):
             jobs = [(src, os.path.join(tmp, f"{k + i:08d}.mp4"), enc) for i, src in enumerate(sources[k:k + per_shard])]
             done = [p for p in pool.map(_encode_one, jobs) if p]
-            path = os.path.join(out_dir, f"shard_{k // per_shard:05d}.zip")
+            path = os.path.join(out_dir, f"shard_{k // per_shard:05d}.{container}")
             pack(done, path)
             shards.append(path)
             for p in done:
@@ -133,10 +151,11 @@ def main() -> None:
         kind = (lambda v: v.lower() in ("1", "true", "yes")) if isinstance(default, bool) else type(default)
         ap.add_argument(f"--{field.replace('_', '-')}", type=kind, default=default)
     ap.add_argument("--per-shard", type=int, default=1000)
+    ap.add_argument("--container", choices=("zip", "tar"), default="zip")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     a = vars(ap.parse_args())
     enc = Encoding(**{k: a[k] for k in asdict(Encoding())})
-    for path in write(a["sources"], a["out_dir"], enc, a["per_shard"], a["workers"]):
+    for path in write(a["sources"], a["out_dir"], enc, a["per_shard"], a["workers"], a["container"]):
         print(path)
 
 

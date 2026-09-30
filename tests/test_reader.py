@@ -39,7 +39,7 @@ def reference(shard: Shard, i: int, frames: list[int], top: int, left: int) -> n
     side -> SIZE) -> crop -> BT.709 limited-range conversion: the core's order, in float."""
     import zipfile
 
-    name = shard.members[i][0]
+    name = shard.members[i].name
     with zipfile.ZipFile(shard.path) as z, z.open(name) as f, av.open(f) as c:
         yuv = [fr.to_ndarray(format="yuv420p") for fr in c.decode(video=0)]
     x = torch.from_numpy(np.stack([yuv[k] for k in frames])).float()
@@ -104,3 +104,42 @@ def test_skipping_unreferenced_samples_is_exact(shards):
     fast = reader.read(items).video
     reader.skip = False
     assert np.array_equal(fast, reader.read(items).video)
+
+
+def test_sources_agree(shards, tmp_path):
+    """zip / tar archives (with the index and with the moov fallback) and a nested folder tree of
+    the same mp4 files return the same clips."""
+    import tarfile
+    import zipfile
+
+    from kohakuclip.writer import pack
+
+    mp4s = []
+    for k, path in enumerate(shards):
+        with zipfile.ZipFile(path) as z:
+            for name in z.namelist():
+                if name.endswith(".mp4"):
+                    dst = tmp_path / "tree" / f"part{k}" / "nested" / name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(z.read(name))
+                    mp4s.append(str(dst))
+    tar = str(tmp_path / "all.tar")
+    pack(mp4s, tar)
+    assert tarfile.is_tarfile(tar)
+
+    def fallback(path):
+        s = Shard(path)
+        s.meta = None
+        return s
+
+    sources = {"zip": list(shards), "zip-moov": [fallback(p) for p in shards], "tar": [tar],
+               "tar-moov": [fallback(tar)], "folder": [str(tmp_path / "tree")]}
+    outs = {}
+    for label, src in sources.items():
+        reader = Reader(src, size=SIZE, augment=Augment(crop="center"))
+        names = [os.path.basename(s.members[i].name) for s, i in reader.videos]
+        by_name = {n: vid for vid, n in enumerate(names)}
+        items = [(by_name[n], [0, 7, 21, 40]) for n in sorted(by_name)]
+        outs[label] = reader.read(items).video
+    for label, out in outs.items():
+        assert np.array_equal(out, outs["zip"]), label
