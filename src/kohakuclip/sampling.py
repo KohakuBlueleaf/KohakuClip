@@ -3,7 +3,9 @@
 import random
 
 
-def clip(n: int, fps: float, frames: int, target_fps: float | None, rng: random.Random) -> list[int]:
+def clip(
+    n: int, fps: float, frames: int, target_fps: float | None, rng: random.Random
+) -> list[int]:
     """A contiguous clip of ``frames`` frames resampled to ``target_fps`` (None: every frame) at a
     random start; frames repeat when the video is shorter than the clip."""
     step = 1.0 if target_fps is None else fps / target_fps

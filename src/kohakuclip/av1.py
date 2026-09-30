@@ -64,8 +64,18 @@ def sequence_header(data: bytes) -> dict:
     else:
         raise ValueError("no sequence header")
     b = Bits(data, s)
-    q = dict(decoder_model=False, equal_interval=False, frame_ids=False, id_len=0, order_bits=0,
-             screen=SELECT, integer_mv=SELECT, ops=[], removal_len=0, presentation_len=0)
+    q = dict(
+        decoder_model=False,
+        equal_interval=False,
+        frame_ids=False,
+        id_len=0,
+        order_bits=0,
+        screen=SELECT,
+        integer_mv=SELECT,
+        ops=[],
+        removal_len=0,
+        presentation_len=0,
+    )
     b.f(3)
     b.f(1)
     q["reduced"] = b.f(1)
@@ -103,7 +113,9 @@ def sequence_header(data: bytes) -> dict:
         delta, extra = b.f(4) + 2, b.f(3) + 1
         q["id_len"] = delta + extra
     b.f(1), b.f(1), b.f(1)  # 128x128 superblock, filter intra, intra edge filter
-    b.f(1), b.f(1), b.f(1), b.f(1)  # interintra, masked compound, warped motion, dual filter
+    b.f(1), b.f(1), b.f(1), b.f(
+        1
+    )  # interintra, masked compound, warped motion, dual filter
     order_hint = b.f(1)
     if order_hint:
         b.f(1), b.f(1)  # jnt comp, ref frame mvs
@@ -118,7 +130,9 @@ def sequence_header(data: bytes) -> dict:
 def refreshes(q: dict, data: bytes, s: int, tid: int, sid: int) -> bool:
     """Whether the frame header at ``data[s:]`` stores anything for later frames (or shows one)."""
     b = Bits(data, s)
-    if q["reduced"] or b.f(1):  # reduced still picture (a key frame), or show_existing_frame
+    if q["reduced"] or b.f(
+        1
+    ):  # reduced still picture (a key frame), or show_existing_frame
         return True
     frame_type, show = b.f(2), b.f(1)
     if show and q["decoder_model"] and not q["equal_interval"]:
@@ -147,13 +161,17 @@ def refreshes(q: dict, data: bytes, s: int, tid: int, sid: int) -> bool:
 
 def keep_bytes(seq: bytes, samples: list[bytes]) -> list[int]:
     """Per temporal unit: bytes to decode when the unit's shown frame is not wanted, i.e. up to the
-    end of the last frame something depends on (a frame spans its header OBU to the next one)."""
+    end of the last frame something depends on (a frame spans its header OBU to the next one).
+    """
     q = sequence_header(seq)
     out = []
     for data in samples:
         keep, needed = 0, False
         for typ, tid, sid, s, e in obus(data):
-            if typ in (OBU_FRAME, OBU_FRAME_HEADER):  # a new frame; tile groups belong to the last one
+            if typ in (
+                OBU_FRAME,
+                OBU_FRAME_HEADER,
+            ):  # a new frame; tile groups belong to the last one
                 needed = refreshes(q, data, s, tid, sid)
             if needed:
                 keep = e

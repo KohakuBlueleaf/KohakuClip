@@ -23,17 +23,24 @@ from .reader import Batch, Reader
 _KRKB = {"bt709": (0.2126, 0.0722), "bt601": (0.299, 0.114)}
 
 
-def yuv_to_rgb(batch: Batch, size: int, device: torch.device | str = "cuda") -> torch.Tensor:
+def yuv_to_rgb(
+    batch: Batch, size: int, device: torch.device | str = "cuda"
+) -> torch.Tensor:
     """``Reader(mode="yuv")`` output -> float RGB in [-1, 1], [B, T, 3, size, size], on ``device``:
-    chroma upsampling, limited-range conversion, antialiased bilinear resize to ``size``, flips."""
+    chroma upsampling, limited-range conversion, antialiased bilinear resize to ``size``, flips.
+    """
     b, t, _ = batch.video.shape
     h, w = (int(v) for v in batch.window[0])
     x = torch.as_tensor(batch.video).to(device, non_blocking=True).view(b * t, -1)
-    y = x[:, :h * w].view(-1, 1, h, w).float()
-    uv = x[:, h * w:].view(-1, 2, h // 2, w // 2).float()
+    y = x[:, : h * w].view(-1, 1, h, w).float()
+    uv = x[:, h * w :].view(-1, 2, h // 2, w // 2).float()
     uv = F.interpolate(uv, size=(h, w), mode="bilinear", align_corners=False)
-    kr, kb = (torch.tensor([_KRKB[c][i] for c in batch.colorspace], device=device).repeat_interleave(t).view(-1, 1, 1, 1)
-              for i in (0, 1))
+    kr, kb = (
+        torch.tensor([_KRKB[c][i] for c in batch.colorspace], device=device)
+        .repeat_interleave(t)
+        .view(-1, 1, 1, 1)
+        for i in (0, 1)
+    )
     kg = 1 - kr - kb
     yy = (y - 16) / 219
     u, v = (uv[:, :1] - 128) / 224, (uv[:, 1:] - 128) / 224
@@ -41,7 +48,9 @@ def yuv_to_rgb(batch: Batch, size: int, device: torch.device | str = "cuda") -> 
     bb = yy + 2 * (1 - kb) * u
     g = (yy - kr * r - kb * bb) / kg
     rgb = torch.cat([r, g, bb], 1).clamp_(0, 1)
-    rgb = F.interpolate(rgb, size=(size, size), mode="bilinear", antialias=True, align_corners=False)
+    rgb = F.interpolate(
+        rgb, size=(size, size), mode="bilinear", antialias=True, align_corners=False
+    )
     rgb = rgb.view(b, t, 3, size, size)
     flips = torch.as_tensor(batch.flips, device=device).bool()
     rgb = torch.where(flips[:, 0].view(b, 1, 1, 1, 1), rgb.flip(-1), rgb)
@@ -58,8 +67,17 @@ class Loader:
     uint8 tensors; YUV batches as ``Batch`` objects for ``yuv_to_rgb``.
     """
 
-    def __init__(self, reader: Reader, sample, batch_size: int, prefetch: int = 2, inflight: int = 2,
-                 steps: int | None = None, seed: int = 0, pin: bool = True):
+    def __init__(
+        self,
+        reader: Reader,
+        sample,
+        batch_size: int,
+        prefetch: int = 2,
+        inflight: int = 2,
+        steps: int | None = None,
+        seed: int = 0,
+        pin: bool = True,
+    ):
         self.reader, self.sample, self.batch_size = reader, sample, batch_size
         self.steps, self.pin, self.inflight = steps, pin, inflight
         self.rng = random.Random(seed)
@@ -71,7 +89,9 @@ class Loader:
         if self.reader.mode != "rgb":
             return None
         s = self.reader.size
-        buf = torch.empty((self.batch_size, t, 3, s, s), dtype=torch.uint8, pin_memory=self.pin)
+        buf = torch.empty(
+            (self.batch_size, t, 3, s, s), dtype=torch.uint8, pin_memory=self.pin
+        )
         return buf
 
     def _run(self):
@@ -82,9 +102,18 @@ class Loader:
                 if self.steps is None or step < self.steps:
                     items = [self.sample(self.rng) for _ in range(self.batch_size)]
                     buf = self._buffer(len(items[0][1]))
-                    pending.append((self.reader.submit(items, None if buf is None else buf.numpy()), buf))
+                    pending.append(
+                        (
+                            self.reader.submit(
+                                items, None if buf is None else buf.numpy()
+                            ),
+                            buf,
+                        )
+                    )
                     step += 1
-                if len(pending) > self.inflight or (self.steps is not None and step >= self.steps):
+                if len(pending) > self.inflight or (
+                    self.steps is not None and step >= self.steps
+                ):
                     job, buf = pending.popleft()
                     batch = job.result()
                     self.queue.put(buf if buf is not None else batch)

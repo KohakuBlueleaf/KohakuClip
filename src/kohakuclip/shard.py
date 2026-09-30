@@ -25,7 +25,15 @@ import numpy as np
 
 INDEX = "__index__.bin"
 MAGIC = b"KCIDX1\0\0"
-FRAME = np.dtype([("off", "<i8"), ("size", "<i4"), ("keep", "<i4"), ("flags", "u1"), ("pad", "u1", (7,))])
+FRAME = np.dtype(
+    [
+        ("off", "<i8"),
+        ("size", "<i4"),
+        ("keep", "<i4"),
+        ("flags", "u1"),
+        ("pad", "u1", (7,)),
+    ]
+)
 KEY = 1  # flags bit 0: keyframe (closed-GOP start)
 # keep: bytes of the sample later frames depend on (AV1: up to the last referenced frame); decoded
 # instead of the whole sample when its frame is not wanted, 0 = left out entirely
@@ -33,24 +41,26 @@ KEY = 1  # flags bit 0: keyframe (closed-GOP start)
 
 @dataclass
 class Video:
-    n: int                # frames
+    n: int  # frames
     fps: float
     h: int
     w: int
-    codec: str            # "av1" | "h264" | "hevc"
-    off: np.ndarray       # [n] absolute byte offset of each frame in its file
-    size: np.ndarray      # [n] bytes
-    keys: np.ndarray      # sorted keyframe indices
-    keep: np.ndarray | None = None  # [n] bytes to decode when the frame is not wanted (None: all)
-    prefix: bytes = b""   # prepended to each GOP's first packet (see ``codec_prefix``)
+    codec: str  # "av1" | "h264" | "hevc"
+    off: np.ndarray  # [n] absolute byte offset of each frame in its file
+    size: np.ndarray  # [n] bytes
+    keys: np.ndarray  # sorted keyframe indices
+    keep: np.ndarray | None = (
+        None  # [n] bytes to decode when the frame is not wanted (None: all)
+    )
+    prefix: bytes = b""  # prepended to each GOP's first packet (see ``codec_prefix``)
     colorspace: str = "bt709"
 
 
 @dataclass
 class Member:
     name: str
-    path: str        # the file holding the mp4 bytes: the archive, or the mp4 itself
-    start: int       # offset of the mp4's first byte in that file (zip: -1, read from its local header)
+    path: str  # the file holding the mp4 bytes: the archive, or the mp4 itself
+    start: int  # offset of the mp4's first byte in that file (zip: -1, read from its local header)
     header: int = 0  # zip: local header offset
 
 
@@ -76,17 +86,27 @@ class Shard:
         elif tarfile.is_tarfile(self.path):
             with tarfile.open(self.path) as t:
                 infos = [m for m in t.getmembers() if m.isfile()]
-            self.members = [Member(m.name, self.path, m.offset_data) for m in infos if m.name != INDEX]
+            self.members = [
+                Member(m.name, self.path, m.offset_data)
+                for m in infos
+                if m.name != INDEX
+            ]
             index = next((m.offset_data for m in infos if m.name == INDEX), None)
         else:
             with zipfile.ZipFile(self.path) as z:
                 infos = z.infolist()
-            self.members = [Member(i.filename, self.path, -1, i.header_offset) for i in infos if i.filename != INDEX]
+            self.members = [
+                Member(i.filename, self.path, -1, i.header_offset)
+                for i in infos
+                if i.filename != INDEX
+            ]
             idx = next((i for i in infos if i.filename == INDEX), None)
             if idx is not None:
                 with open(self.path, "rb") as f:
                     index = data_offset(f, idx.header_offset)
-        self.meta, self.frames = self._open_index(index) if index is not None else (None, None)
+        self.meta, self.frames = (
+            self._open_index(index) if index is not None else (None, None)
+        )
         self._moov = lru_cache(maxsize=moov_cache)(self._parse_moov)
 
     def __len__(self) -> int:
@@ -105,11 +125,13 @@ class Shard:
 
     def _open_index(self, start: int):
         mm = mmap.mmap(self.fd(0), 0, prot=mmap.PROT_READ)
-        if mm[start:start + 8] != MAGIC:
+        if mm[start : start + 8] != MAGIC:
             raise ValueError(f"{self.path}: bad index magic")
-        jlen = struct.unpack("<Q", mm[start + 8:start + 16])[0]
-        meta = json.loads(mm[start + 16:start + 16 + jlen])["videos"]
-        rec = start + 16 + jlen + (-(16 + jlen) % 8)  # records are 8-aligned within the member
+        jlen = struct.unpack("<Q", mm[start + 8 : start + 16])[0]
+        meta = json.loads(mm[start + 16 : start + 16 + jlen])["videos"]
+        rec = (
+            start + 16 + jlen + (-(16 + jlen) % 8)
+        )  # records are 8-aligned within the member
         total = sum(v["n"] for v in meta)
         frames = np.frombuffer(mm, FRAME, count=total, offset=rec)
         return meta, frames
@@ -118,43 +140,60 @@ class Shard:
         if self.meta is None:
             return self._moov(i)
         m = self.meta[i]
-        fr = self.frames[m["row"]:m["row"] + m["n"]]
-        return Video(m["n"], m["fps"], m["h"], m["w"], m["codec"], fr["off"], fr["size"],
-                     np.flatnonzero(fr["flags"] & KEY), fr["keep"],
-                     bytes.fromhex(m.get("prefix", "")), m.get("colorspace", "bt709"))
+        fr = self.frames[m["row"] : m["row"] + m["n"]]
+        return Video(
+            m["n"],
+            m["fps"],
+            m["h"],
+            m["w"],
+            m["codec"],
+            fr["off"],
+            fr["size"],
+            np.flatnonzero(fr["flags"] & KEY),
+            fr["keep"],
+            bytes.fromhex(m.get("prefix", "")),
+            m.get("colorspace", "bt709"),
+        )
 
     def _parse_moov(self, i: int) -> Video:
         m = self.members[i]
         fd = self.fd(i)
         at = m.header if m.start < 0 else m.start
         buf = os.pread(fd, 64 * 1024, at)
-        pos = 30 + sum(struct.unpack("<HH", buf[26:30])) if m.start < 0 else 0  # skip the zip local header
+        pos = (
+            30 + sum(struct.unpack("<HH", buf[26:30])) if m.start < 0 else 0
+        )  # skip the zip local header
         base = at + pos
         while True:  # ftyp, then moov (faststart); read the whole moov if it is larger
-            size, typ = struct.unpack(">I4s", buf[pos:pos + 8])
+            size, typ = struct.unpack(">I4s", buf[pos : pos + 8])
             if typ == b"moov":
                 if pos + size > len(buf):
                     buf = os.pread(fd, pos + size, at)
-                return parse_moov(memoryview(buf)[pos:pos + size], base)
+                return parse_moov(memoryview(buf)[pos : pos + size], base)
             if typ == b"mdat":
-                raise ValueError(f"{self.path}:{m.name} is not faststart (moov after mdat)")
+                raise ValueError(
+                    f"{self.path}:{m.name} is not faststart (moov after mdat)"
+                )
             pos += size
 
 
 def codec_prefix(codec: str, config: bytes) -> bytes:
     """Decoder prefix from an mp4 codec configuration record (av1C / avcC / hvcC payload): the AV1
-    sequence header, or the H.264 / HEVC parameter sets in Annex B. mp4 keeps these out of band."""
+    sequence header, or the H.264 / HEVC parameter sets in Annex B. mp4 keeps these out of band.
+    """
     if codec == "av1":
         return config[4:]  # 4-byte av1C header, then configOBUs
     start, nals = b"\0\0\0\1", []
-    if codec == "h264":  # avcC: [5] & 31 SPS, each u16 length + NAL; then u8 PPS count, same layout
+    if (
+        codec == "h264"
+    ):  # avcC: [5] & 31 SPS, each u16 length + NAL; then u8 PPS count, same layout
         if config[4] & 3 != 3:
             raise ValueError("only 4-byte NAL lengths are supported")
         i, count = 6, config[5] & 31
         for _ in range(2):
             for _ in range(count):
-                n = struct.unpack(">H", config[i:i + 2])[0]
-                nals.append(config[i + 2:i + 2 + n])
+                n = struct.unpack(">H", config[i : i + 2])[0]
+                nals.append(config[i + 2 : i + 2 + n])
                 i += 2 + n
             count, i = config[i] if i < len(config) else 0, i + 1
     else:  # hvcC: 22-byte header (lengthSizeMinusOne in [21] & 3), then arrays of NAL units
@@ -162,11 +201,11 @@ def codec_prefix(codec: str, config: bytes) -> bytes:
             raise ValueError("only 4-byte NAL lengths are supported")
         i = 23
         for _ in range(config[22]):
-            count = struct.unpack(">H", config[i + 1:i + 3])[0]
+            count = struct.unpack(">H", config[i + 1 : i + 3])[0]
             i += 3
             for _ in range(count):
-                n = struct.unpack(">H", config[i:i + 2])[0]
-                nals.append(config[i + 2:i + 2 + n])
+                n = struct.unpack(">H", config[i : i + 2])[0]
+                nals.append(config[i + 2 : i + 2 + n])
                 i += 2 + n
     return b"".join(start + n for n in nals)
 
@@ -175,10 +214,10 @@ def codec_prefix(codec: str, config: bytes) -> bytes:
 def _boxes(buf, start, end):
     i = start
     while i + 8 <= end:
-        size, typ = struct.unpack(">I4s", buf[i:i + 8])
+        size, typ = struct.unpack(">I4s", buf[i : i + 8])
         head = 8
         if size == 1:
-            size, head = struct.unpack(">Q", buf[i + 8:i + 16])[0], 16
+            size, head = struct.unpack(">Q", buf[i + 8 : i + 16])[0], 16
         yield typ, i + head, i + size
         i += size
 
@@ -191,50 +230,61 @@ def _find(buf, path, start, end):
 
 
 def _u32(buf, at, count):
-    return np.frombuffer(buf[at:at + 4 * count], ">u4").astype(np.int64)
+    return np.frombuffer(buf[at : at + 4 * count], ">u4").astype(np.int64)
 
 
 def parse_moov(buf, base: int) -> Video:
     """Frame table of the first video track: sizes (stsz), chunk offsets (stco/co64) + samples per
-    chunk (stsc) -> absolute offsets, sync samples (stss), fps (mdhd + stts), size and codec (stsd)."""
+    chunk (stsc) -> absolute offsets, sync samples (stss), fps (mdhd + stts), size and codec (stsd).
+    """
     trak = _find(buf, [b"trak"], 8, len(buf))
     stbl = _find(buf, [b"mdia", b"minf", b"stbl"], *trak)
     box = {t: (s, e) for t, s, e in _boxes(buf, *stbl)}
     s = box[b"stsz"][0]
-    fixed, n = struct.unpack(">II", buf[s + 4:s + 12])
+    fixed, n = struct.unpack(">II", buf[s + 4 : s + 12])
     size = np.full(n, fixed, np.int64) if fixed else _u32(buf, s + 12, n)
     if b"stco" in box:
         s = box[b"stco"][0]
-        chunks = _u32(buf, s + 8, struct.unpack(">I", buf[s + 4:s + 8])[0])
+        chunks = _u32(buf, s + 8, struct.unpack(">I", buf[s + 4 : s + 8])[0])
     else:
         s = box[b"co64"][0]
-        k = struct.unpack(">I", buf[s + 4:s + 8])[0]
-        chunks = np.frombuffer(buf[s + 8:s + 8 + 8 * k], ">u8").astype(np.int64)
+        k = struct.unpack(">I", buf[s + 4 : s + 8])[0]
+        chunks = np.frombuffer(buf[s + 8 : s + 8 + 8 * k], ">u8").astype(np.int64)
     s = box[b"stsc"][0]
-    k = struct.unpack(">I", buf[s + 4:s + 8])[0]
+    k = struct.unpack(">I", buf[s + 4 : s + 8])[0]
     stsc = _u32(buf, s + 8, 3 * k).reshape(k, 3)
     per_chunk = np.empty(len(chunks), np.int64)
     for j in range(k):
-        per_chunk[stsc[j, 0] - 1:(stsc[j + 1, 0] - 1 if j + 1 < k else len(chunks))] = stsc[j, 1]
+        per_chunk[
+            stsc[j, 0] - 1 : (stsc[j + 1, 0] - 1 if j + 1 < k else len(chunks))
+        ] = stsc[j, 1]
     first = np.concatenate([[0], np.cumsum(per_chunk)[:-1]])
     chunk_of = np.repeat(np.arange(len(chunks)), per_chunk)
     csum = np.concatenate([[0], np.cumsum(size)])
     off = base + chunks[chunk_of] + (csum[:-1] - csum[first[chunk_of]])
     if b"stss" in box:
         s = box[b"stss"][0]
-        keys = _u32(buf, s + 8, struct.unpack(">I", buf[s + 4:s + 8])[0]) - 1
+        keys = _u32(buf, s + 8, struct.unpack(">I", buf[s + 4 : s + 8])[0]) - 1
     else:
         keys = np.arange(n)
     s, _ = _find(buf, [b"mdia", b"mdhd"], *trak)
-    timescale = struct.unpack(">I", buf[s + (20 if buf[s] == 1 else 12):][:4])[0]
+    timescale = struct.unpack(">I", buf[s + (20 if buf[s] == 1 else 12) :][:4])[0]
     s = box[b"stts"][0]
-    stts = _u32(buf, s + 8, 2 * struct.unpack(">I", buf[s + 4:s + 8])[0]).reshape(-1, 2)
+    stts = _u32(buf, s + 8, 2 * struct.unpack(">I", buf[s + 4 : s + 8])[0]).reshape(
+        -1, 2
+    )
     fps = timescale * stts[:, 0].sum() / max(1, (stts[:, 0] * stts[:, 1]).sum())
     s, e = box[b"stsd"]
-    entry = bytes(buf[s + 8:e])
-    codec = {b"av01": "av1", b"avc1": "h264", b"hvc1": "hevc", b"hev1": "hevc"}[entry[4:8]]
-    h, w = struct.unpack(">HH", entry[8 + 24:8 + 28])[::-1]
+    entry = bytes(buf[s + 8 : e])
+    codec = {b"av01": "av1", b"avc1": "h264", b"hvc1": "hevc", b"hev1": "hevc"}[
+        entry[4:8]
+    ]
+    h, w = struct.unpack(">HH", entry[8 + 24 : 8 + 28])[::-1]
     tag = {"av1": b"av1C", "h264": b"avcC", "hevc": b"hvcC"}[codec]
     j = entry.find(tag)
-    prefix = codec_prefix(codec, entry[j + 4:j - 4 + struct.unpack(">I", entry[j - 4:j])[0]])
-    return Video(n, float(fps), h, w, codec, off, size, np.asarray(keys, np.int64), None, prefix)
+    prefix = codec_prefix(
+        codec, entry[j + 4 : j - 4 + struct.unpack(">I", entry[j - 4 : j])[0]]
+    )
+    return Video(
+        n, float(fps), h, w, codec, off, size, np.asarray(keys, np.int64), None, prefix
+    )

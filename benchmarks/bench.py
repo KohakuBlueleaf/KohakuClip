@@ -30,14 +30,26 @@ def sampler(reader: Reader, mode: str):
     def sample(rng):
         vid = rng.randrange(len(reader))
         v = reader.info(vid)
-        return vid, (random_frames(v.n, frames, rng) if fps is None else clip(v.n, v.fps, frames, fps, rng))
+        return vid, (
+            random_frames(v.n, frames, rng)
+            if fps is None
+            else clip(v.n, v.fps, frames, fps, rng)
+        )
 
     return sample
 
 
 def run(shards, mode, threads, batches, batch, fmt, inflight, skip=True, seed=0):
     """Decode ``batches`` batches with up to ``inflight`` extra batches queued (0: one at a time)."""
-    reader = Reader(shards, size=256, mode=fmt, threads=threads, augment=Augment(hflip=0.5), seed=seed, skip=skip)
+    reader = Reader(
+        shards,
+        size=256,
+        mode=fmt,
+        threads=threads,
+        augment=Augment(hflip=0.5),
+        seed=seed,
+        skip=skip,
+    )
     sample, rng = sampler(reader, mode), random.Random(seed)
     reader.read([sample(rng) for _ in range(batch)])  # warm-up: decoders, first opens
     profile(reset=True)
@@ -66,7 +78,9 @@ def drop_cache(shards):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("shards")
     ap.add_argument("--threads", type=int, nargs="+", default=[1, 4, 16])
     ap.add_argument("--modes", nargs="+", default=list(MODES))
@@ -75,8 +89,12 @@ def main():
     ap.add_argument("--cold", action="store_true")
     ap.add_argument("--batches", type=int, default=20)
     ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--inflight", type=int, default=2, help="batches queued ahead (threads)")
-    ap.add_argument("--no-skip", action="store_true", help="decode samples nothing depends on too")
+    ap.add_argument(
+        "--inflight", type=int, default=2, help="batches queued ahead (threads)"
+    )
+    ap.add_argument(
+        "--no-skip", action="store_true", help="decode samples nothing depends on too"
+    )
     a = ap.parse_args()
     shards = sorted(glob.glob(os.path.join(a.shards, "*.zip")))
     for mode in a.modes:
@@ -87,21 +105,63 @@ def main():
                 if a.cold:
                     drop_cache(shards)
                 if kind == "threads":
-                    wall, prof = run(shards, mode, k, a.batches, a.batch, a.mode, a.inflight, not a.no_skip)
+                    wall, prof = run(
+                        shards,
+                        mode,
+                        k,
+                        a.batches,
+                        a.batch,
+                        a.mode,
+                        a.inflight,
+                        not a.no_skip,
+                    )
                     clips = a.batches * a.batch
                 else:
                     with mp.get_context("spawn").Pool(k) as pool:
                         t0 = time.perf_counter()
-                        rs = pool.map(_proc, [(shards, mode, a.batches, a.batch, a.mode, not a.no_skip, i) for i in range(k)])
+                        rs = pool.map(
+                            _proc,
+                            [
+                                (
+                                    shards,
+                                    mode,
+                                    a.batches,
+                                    a.batch,
+                                    a.mode,
+                                    not a.no_skip,
+                                    i,
+                                )
+                                for i in range(k)
+                            ],
+                        )
                     wall = max(r[0] for r in rs)
                     prof = {s: sum(r[1][s] for r in rs) for s in rs[0][1]}
                     clips = k * a.batches * a.batch
                 frames = clips * t
-                row = dict(mode=mode, fmt=a.mode, kind=kind, cores=k, skip=not a.no_skip, clips_per_s=clips / wall,
-                           frames_per_s=frames / wall, ms_per_frame_per_core=1000 * wall * k / frames,
-                           **{f"{s}_ms_per_frame": 1000 * prof[s] / frames for s in ("read", "decode", "convert", "resize")},
-                           decoded_per_out=prof["decoded"] / frames)
-                print(json.dumps({k2: (round(v, 3) if isinstance(v, float) else v) for k2, v in row.items()}), flush=True)
+                row = dict(
+                    mode=mode,
+                    fmt=a.mode,
+                    kind=kind,
+                    cores=k,
+                    skip=not a.no_skip,
+                    clips_per_s=clips / wall,
+                    frames_per_s=frames / wall,
+                    ms_per_frame_per_core=1000 * wall * k / frames,
+                    **{
+                        f"{s}_ms_per_frame": 1000 * prof[s] / frames
+                        for s in ("read", "decode", "convert", "resize")
+                    },
+                    decoded_per_out=prof["decoded"] / frames,
+                )
+                print(
+                    json.dumps(
+                        {
+                            k2: (round(v, 3) if isinstance(v, float) else v)
+                            for k2, v in row.items()
+                        }
+                    ),
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

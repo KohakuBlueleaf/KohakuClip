@@ -14,20 +14,41 @@ STAGES = ("read", "decode", "convert", "resize")
 
 class Request(C.Structure):
     _fields_ = [
-        ("fd", C.c_int32), ("codec", C.c_int32), ("mode", C.c_int32), ("ngroups", C.c_int32),
-        ("group_off", C.c_void_p), ("group_len", C.c_void_p), ("group_npk", C.c_void_p), ("pk_off", C.c_void_p),
-        ("pk_len", C.c_void_p), ("pk_idx", C.c_void_p),
-        ("prefix", C.c_void_p), ("nprefix", C.c_int32), ("nwant", C.c_int32), ("want", C.c_void_p),
-        ("nh", C.c_int32), ("nw", C.c_int32), ("top", C.c_int32), ("left", C.c_int32),
-        ("oh", C.c_int32), ("ow", C.c_int32), ("hflip", C.c_int32), ("vflip", C.c_int32), ("out", C.c_void_p),
+        ("fd", C.c_int32),
+        ("codec", C.c_int32),
+        ("mode", C.c_int32),
+        ("ngroups", C.c_int32),
+        ("group_off", C.c_void_p),
+        ("group_len", C.c_void_p),
+        ("group_npk", C.c_void_p),
+        ("pk_off", C.c_void_p),
+        ("pk_len", C.c_void_p),
+        ("pk_idx", C.c_void_p),
+        ("prefix", C.c_void_p),
+        ("nprefix", C.c_int32),
+        ("nwant", C.c_int32),
+        ("want", C.c_void_p),
+        ("nh", C.c_int32),
+        ("nw", C.c_int32),
+        ("top", C.c_int32),
+        ("left", C.c_int32),
+        ("oh", C.c_int32),
+        ("ow", C.c_int32),
+        ("hflip", C.c_int32),
+        ("vflip", C.c_int32),
+        ("out", C.c_void_p),
     ]
 
 
 def _load() -> C.CDLL:
     here = os.path.dirname(os.path.abspath(__file__))
-    found = glob.glob(os.path.join(here, "_kc*.so")) or glob.glob(os.path.join(here, "native", "_kc*.so"))
+    found = glob.glob(os.path.join(here, "_kc*.so")) or glob.glob(
+        os.path.join(here, "native", "_kc*.so")
+    )
     if not found:
-        raise ImportError("kohakuclip native core not built (pip install -e . or python -m kohakuclip.build)")
+        raise ImportError(
+            "kohakuclip native core not built (pip install -e . or python -m kohakuclip.build)"
+        )
     lib = C.CDLL(found[0])
     lib.kc_submit.argtypes = [C.POINTER(Request), C.c_int, C.c_int, C.c_void_p]
     lib.kc_submit.restype = C.c_void_p
@@ -47,7 +68,9 @@ class Job:
     def __init__(self, requests: list[Request], threads: int):
         self.requests = (Request * len(requests))(*requests)
         self.status = np.zeros(len(requests), np.int32)
-        self.handle = _lib.kc_submit(self.requests, len(requests), threads, self.status.ctypes.data)
+        self.handle = _lib.kc_submit(
+            self.requests, len(requests), threads, self.status.ctypes.data
+        )
 
     def wait(self) -> np.ndarray:
         """Block until decoded; returns the per-request status (0 = ok)."""
@@ -63,4 +86,8 @@ def profile(reset: bool = False) -> dict:
     ns = np.zeros(len(STAGES), np.int64)
     frames = np.zeros(2, np.int64)
     _lib.kc_profile(ns.ctypes.data, frames.ctypes.data, int(reset))
-    return {**{s: float(v) / 1e9 for s, v in zip(STAGES, ns)}, "frames": int(frames[0]), "decoded": int(frames[1])}
+    return {
+        **{s: float(v) / 1e9 for s, v in zip(STAGES, ns)},
+        "frames": int(frames[0]),
+        "decoded": int(frames[1]),
+    }

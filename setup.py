@@ -14,8 +14,12 @@ def ffmpeg():
     prefix = os.environ.get("KOHAKUCLIP_FFMPEG")
     if prefix:
         return [os.path.join(prefix, "include")], [os.path.join(prefix, "lib")]
-    flags = subprocess.check_output(["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil"], text=True).split()
-    return [f[2:] for f in flags if f.startswith("-I")], [f[2:] for f in flags if f.startswith("-L")]
+    flags = subprocess.check_output(
+        ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil"], text=True
+    ).split()
+    return [f[2:] for f in flags if f.startswith("-I")], [
+        f[2:] for f in flags if f.startswith("-L")
+    ]
 
 
 include, lib = ffmpeg()
@@ -27,7 +31,12 @@ setup(
             include_dirs=include,
             library_dirs=lib,
             libraries=["avcodec", "avutil"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread", f"-march={os.environ.get('KOHAKUCLIP_MARCH', 'native')}"],
+            extra_compile_args=[
+                "-O3",
+                "-std=c++17",
+                "-pthread",
+                f"-march={os.environ.get('KOHAKUCLIP_MARCH', 'native')}",
+            ],
             extra_link_args=["-pthread"] + [f"-Wl,-rpath,{d}" for d in lib],
             language="c++",
         )
