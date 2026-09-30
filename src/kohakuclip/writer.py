@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from .shard import FRAME, INDEX, KEY, MAGIC, SKIP, codec_prefix, data_offset
+from .shard import FRAME, INDEX, KEY, MAGIC, codec_prefix, data_offset
 
 
 @dataclass
@@ -57,23 +57,24 @@ def encode(src: str, dst: str, enc: Encoding) -> None:
 
 
 def frame_table(path: str) -> tuple[list, dict]:
-    """(offset in file, size, flags) per frame and the video metadata, read with PyAV."""
+    """(offset in file, size, keep bytes, flags) per frame and the video metadata, read with PyAV."""
     import av
 
     with av.open(path) as c:
         s = c.streams.video[0]
-        rows = [(p.pos, p.size, KEY if p.is_keyframe else 0) for p in c.demux(s) if p.size]
+        rows = [(p.pos, p.size, p.size, KEY if p.is_keyframe else 0) for p in c.demux(s) if p.size]
         ctx = s.codec_context
         codec = {"av1": "av1", "libdav1d": "av1", "h264": "h264", "hevc": "hevc"}[ctx.name]
         prefix = codec_prefix(codec, bytes(ctx.extradata or b"")).hex()
         meta = dict(n=len(rows), fps=float(s.average_rate or s.guessed_rate), h=ctx.height, w=ctx.width,
                     codec=codec, prefix=prefix, colorspace="bt709")
-    if codec == "av1":  # flag samples nothing depends on (see kohakuclip.av1)
-        from .av1 import skippable
+    if codec == "av1":  # bytes later frames depend on (see kohakuclip.av1)
+        from .av1 import keep_bytes
 
         with open(path, "rb") as f:
-            samples = [(f.seek(off), f.read(size))[1] for off, size, _ in rows]
-        rows = [(off, size, flags | (SKIP if s else 0)) for (off, size, flags), s in zip(rows, skippable(bytes.fromhex(prefix), samples))]
+            samples = [(f.seek(off), f.read(size))[1] for off, size, _, _ in rows]
+        keep = keep_bytes(bytes.fromhex(prefix), samples)
+        rows = [(off, size, k, flags) for (off, size, _, flags), k in zip(rows, keep)]
     return rows, meta
 
 
@@ -88,7 +89,7 @@ def pack(mp4s: list[str], zip_path: str) -> None:
             base = data_offset(f, info.header_offset)
             rows, meta = frame_table(p)
             videos.append(dict(member=info.filename, row=len(records), **meta))
-            records += [(base + off, size, flags, (0, 0, 0)) for off, size, flags in rows]
+            records += [(base + off, size, keep, flags, (0,) * 7) for off, size, keep, flags in rows]
     meta = json.dumps(dict(videos=videos)).encode()
     head = MAGIC + struct.pack("<Q", len(meta)) + meta
     head += b"\0" * (-len(head) % 8)

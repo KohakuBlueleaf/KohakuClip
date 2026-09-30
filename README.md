@@ -37,18 +37,21 @@ kohakuclip-write out_dir videos/*.mp4 --codec av1 --crf 36 --per-shard 1000
 Defaults (measured below): native fps, short side capped at 512 (never upscaled), closed GOP of
 16, AV1 via SVT-AV1 preset 6 with the in-loop filters (deblocking, CDEF, loop restoration) off,
 faststart mp4, zip in stored mode. Needs an `ffmpeg` with libsvtav1 (or libx264 for
-`--codec h264`) and PyAV. The writer also parses the AV1 frame headers and flags the samples
-nothing depends on, so the reader can leave them out.
+`--codec h264`) and PyAV. The writer also parses the AV1 frame headers and records, per sample,
+how many bytes later frames depend on: SVT-AV1 puts half of all frames in a top layer nothing
+references, so unwanted samples are decoded only up to their last referenced frame (25 % of
+samples are dropped entirely, 25 % truncated), bit-exactly.
 
 Shard layout: `shard_XXXXX.zip` = the mp4 files + `__index__.bin` (per frame: absolute byte
-offset, size, keyframe / skippable flags; per video: fps, size, codec, decoder prefix). The index
+offset, size, bytes later frames depend on, keyframe flag; per video: fps, size, codec, decoder
+prefix). The index
 is memory-mapped from the zip (shared by all workers through the page cache). Without it, each
 video's frame table is parsed from its own `moov` box on first use (faststart puts it first).
 
 ## How a clip is read
 
 1. Python plans each clip from the index: wanted frames -> one byte range per GOP (keyframe to
-   last wanted frame), skippable samples left out, crop and flips.
+   last wanted frame), unwanted samples cut to the bytes later frames need, crop and flips.
 2. One native call per batch (`Reader.submit` / `Pending.result`): per GOP one `pread`, decode
    with a persistent per-thread decoder (libdav1d for AV1, libavcodec for H.264 / HEVC), then per
    wanted frame: antialiased bilinear resize of each YUV plane fused with the crop (only the source
@@ -79,7 +82,7 @@ Clips from 60-300 s videos cost the same as from 3-30 s ones (one read per GOP).
 | setting | effect (ms per output frame, one core) |
 |---|---|
 | AV1 in-loop filters off (writer) | -20 to -27 % decode, same size, same crop quality |
-| skip samples nothing depends on | 8f@6 4.27 -> 4.04, 16f@6 4.01 -> 3.71, 8 random 6.48 -> 6.08 (bit-exact) |
+| decode only what later frames need of unwanted samples (`skip=True`) | 8f@6 4.29 -> 3.27, 8 random 6.62 -> 5.12 (whole-unit skipping alone: 3.65 / 5.72); bit-exact |
 | resize YUV planes, then convert (vs convert, then resize) | 4.97 -> 4.22; the two agree at 48.4 dB (differ only at saturated edges) |
 | `mode="yuv"` (GPU converts + resizes) | CPU 3.94 -> 3.24 (8f@6), 2.27 -> 1.59 (8f@24); GPU +21 us/frame; 2x the bytes at 512p storage; 48.7 dB vs rgb |
 | threads, 2 batches in flight vs synchronous | 16 cores 5.04 -> 4.72, 24 cores 5.99 -> 4.53 (= separate processes) |

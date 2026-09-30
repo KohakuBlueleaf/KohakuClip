@@ -57,7 +57,7 @@ class Reader:
     def __init__(self, shards, size: int = 256, mode: str = "rgb", threads: int = 1,
                  augment: Augment | None = None, seed: int | None = None, skip: bool = True):
         self.shards = [s if isinstance(s, Shard) else Shard(s) for s in shards]
-        self.skip = skip  # leave out unwanted samples nothing depends on (AV1, needs the index)
+        self.skip = skip  # decode only what later frames need of unwanted samples (AV1, needs the index)
         self.videos = [(s, i) for s in self.shards for i in range(len(s))]
         self.size, self.mode, self.threads = size, mode, threads
         self.augment = augment or Augment()
@@ -104,13 +104,15 @@ class Reader:
 
     def _plan(self, v: Video, fd: int, want: np.ndarray, target: np.ndarray, side: int | None):
         # one group per GOP that holds wanted frames: bytes from its keyframe to its last wanted frame
-        # samples nothing depends on are left out unless wanted (their bytes are still in the range)
+        # unwanted samples: only the bytes later frames depend on (``keep``), left out if none
         key_of = v.keys[np.searchsorted(v.keys, want, side="right") - 1]
         starts, first = np.unique(key_of, return_index=True)
         ends = np.maximum.reduceat(want, first) + 1
         groups = [np.arange(a, e, dtype=np.int32) for a, e in zip(starts, ends)]
-        if self.skip and v.skip is not None:
-            groups = [g[~v.skip[g] | np.isin(g, want)] for g in groups]
+        size = v.size
+        if self.skip and v.keep is not None:
+            size = np.where(np.isin(np.arange(v.n), want), v.size, v.keep)
+            groups = [g[size[g] > 0] for g in groups]
         pk = np.concatenate(groups)
         base = np.repeat(v.off[starts], [len(g) for g in groups])
         arrays = dict(
@@ -118,7 +120,7 @@ class Reader:
             group_len=np.ascontiguousarray(v.off[ends - 1] + v.size[ends - 1] - v.off[starts], np.int64),
             group_npk=np.array([len(g) for g in groups], np.int32),
             pk_off=np.ascontiguousarray(v.off[pk] - base, np.int64),
-            pk_len=np.ascontiguousarray(v.size[pk], np.int32),
+            pk_len=np.ascontiguousarray(size[pk], np.int32),
             pk_idx=pk,
             want=want,
             prefix=np.frombuffer(v.prefix, np.uint8) if v.prefix else None,

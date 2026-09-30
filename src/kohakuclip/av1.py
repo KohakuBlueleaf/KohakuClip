@@ -1,9 +1,10 @@
-"""Which AV1 temporal units no later frame depends on (write time only).
+"""How much of each AV1 temporal unit later frames depend on (write time only).
 
-A temporal unit (one mp4 sample) can be skipped when it is not wanted and every frame in it has
-``refresh_frame_flags == 0``: nothing is stored for later frames. SVT-AV1's random-access hierarchy
-puts half of all frames in that top layer. Parses the sequence header and each frame header up to
-``refresh_frame_flags`` (AV1 spec 5.5, 5.9.2).
+A frame with ``refresh_frame_flags == 0`` stores nothing for later frames; SVT-AV1's random-access
+hierarchy puts half of all frames in that top layer, usually as the shown frame at the end of a
+temporal unit (one mp4 sample) after hidden reference frames. When the sample is not wanted, only
+the bytes up to the last frame something depends on need decoding (``keep``; 0: none). Parses the
+sequence header and each frame header up to ``refresh_frame_flags`` (AV1 spec 5.5, 5.9.2).
 """
 
 OBU_SEQUENCE_HEADER, OBU_FRAME_HEADER, OBU_FRAME = 1, 3, 6
@@ -144,11 +145,17 @@ def refreshes(q: dict, data: bytes, s: int, tid: int, sid: int) -> bool:
     return b.f(8) != 0  # refresh_frame_flags
 
 
-def skippable(seq: bytes, samples: list[bytes]) -> list[bool]:
-    """Per temporal unit: True when none of its frames is kept for later frames."""
+def keep_bytes(seq: bytes, samples: list[bytes]) -> list[int]:
+    """Per temporal unit: bytes to decode when the unit's shown frame is not wanted, i.e. up to the
+    end of the last frame something depends on (a frame spans its header OBU to the next one)."""
     q = sequence_header(seq)
     out = []
     for data in samples:
-        headers = [(tid, sid, s) for typ, tid, sid, s, _ in obus(data) if typ in (OBU_FRAME, OBU_FRAME_HEADER)]
-        out.append(bool(headers) and not any(refreshes(q, data, s, tid, sid) for tid, sid, s in headers))
+        keep, needed = 0, False
+        for typ, tid, sid, s, e in obus(data):
+            if typ in (OBU_FRAME, OBU_FRAME_HEADER):  # a new frame; tile groups belong to the last one
+                needed = refreshes(q, data, s, tid, sid)
+            if needed:
+                keep = e
+        out.append(keep)
     return out

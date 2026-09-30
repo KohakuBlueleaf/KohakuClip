@@ -21,9 +21,10 @@ import numpy as np
 
 INDEX = "__index__.bin"
 MAGIC = b"KCIDX1\0\0"
-FRAME = np.dtype([("off", "<i8"), ("size", "<i4"), ("flags", "u1"), ("pad", "u1", (3,))])
-KEY = 1   # flags bit 0: keyframe (closed-GOP start)
-SKIP = 2  # flags bit 1: nothing later depends on this sample (AV1 top-layer frame): skip unless wanted
+FRAME = np.dtype([("off", "<i8"), ("size", "<i4"), ("keep", "<i4"), ("flags", "u1"), ("pad", "u1", (7,))])
+KEY = 1  # flags bit 0: keyframe (closed-GOP start)
+# keep: bytes of the sample later frames depend on (AV1: up to the last referenced frame); decoded
+# instead of the whole sample when its frame is not wanted, 0 = left out entirely
 
 
 @dataclass
@@ -36,7 +37,7 @@ class Video:
     off: np.ndarray       # [n] absolute byte offset of each frame in the shard
     size: np.ndarray      # [n] bytes
     keys: np.ndarray      # sorted keyframe indices
-    skip: np.ndarray | None = None  # [n] bool, samples that may be left out when not wanted
+    keep: np.ndarray | None = None  # [n] bytes to decode when the frame is not wanted (None: all)
     prefix: bytes = b""   # prepended to each GOP's first packet (see ``codec_prefix``)
     colorspace: str = "bt709"
 
@@ -82,7 +83,7 @@ class Shard:
         m = self.meta[i]
         fr = self.frames[m["row"]:m["row"] + m["n"]]
         return Video(m["n"], m["fps"], m["h"], m["w"], m["codec"], fr["off"], fr["size"],
-                     np.flatnonzero(fr["flags"] & KEY), (fr["flags"] & SKIP) != 0,
+                     np.flatnonzero(fr["flags"] & KEY), fr["keep"],
                      bytes.fromhex(m.get("prefix", "")), m.get("colorspace", "bt709"))
 
     def _parse_moov(self, i: int) -> Video:
