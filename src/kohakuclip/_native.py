@@ -47,8 +47,9 @@ def decode(requests: list[Request], threads: int) -> np.ndarray:
 
 
 def profile(reset: bool = False) -> dict:
-    """Cumulative time per stage (seconds, summed over threads) and frames emitted since the last reset."""
+    """Cumulative time per stage (seconds, summed over threads) and frames emitted / decoded since
+    the last reset."""
     ns = np.zeros(len(STAGES), np.int64)
-    frames = np.zeros(1, np.int64)
+    frames = np.zeros(2, np.int64)
     _lib.kc_profile(ns.ctypes.data, frames.ctypes.data, int(reset))
-    return {**{s: float(v) / 1e9 for s, v in zip(STAGES, ns)}, "frames": int(frames[0])}
+    return {**{s: float(v) / 1e9 for s, v in zip(STAGES, ns)}, "frames": int(frames[0]), "decoded": int(frames[1])}

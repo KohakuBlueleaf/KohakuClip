@@ -35,8 +35,8 @@ def shards(request, tmp_path_factory):
 
 
 def reference(shard: Shard, i: int, frames: list[int], top: int, left: int) -> np.ndarray:
-    """PyAV decode (YUV planes) -> RGB with the core's conventions (centered bilinear chroma, BT.709
-    limited range) -> torch antialiased resize of the short side -> crop."""
+    """PyAV decode (YUV planes) -> torch antialiased resize of each plane onto the output grid (short
+    side -> SIZE) -> crop -> BT.709 limited-range conversion: the core's order, in float."""
     import zipfile
 
     name = shard.members[i][0]
@@ -44,16 +44,14 @@ def reference(shard: Shard, i: int, frames: list[int], top: int, left: int) -> n
         yuv = [fr.to_ndarray(format="yuv420p") for fr in c.decode(video=0)]
     x = torch.from_numpy(np.stack([yuv[k] for k in frames])).float()
     h, w = x.shape[1] * 2 // 3, x.shape[2]
-    y = x[:, :h]
-    u = x[:, h:h + h // 4].reshape(-1, 1, h // 2, w // 2)
-    v = x[:, h + h // 4:].reshape(-1, 1, h // 2, w // 2)
-    u, v = (F.interpolate(c, size=(h, w), mode="bilinear", align_corners=False)[:, 0] - 128 for c in (u, v))
-    yy, s = (y - 16) * 255 / 219, 255 / 224
-    rgb = torch.stack([yy + 1.5748 * s * v, yy - 0.187324 * s * u - 0.468124 * s * v, yy + 1.8556 * s * u], 1)
-    rgb = rgb.round().clamp(0, 255)
     sc = SIZE / min(h, w)
-    rgb = F.interpolate(rgb, size=(max(SIZE, round(h * sc)), max(SIZE, round(w * sc))), mode="bilinear", antialias=True)
-    return rgb[..., top:top + SIZE, left:left + SIZE].round().clamp(0, 255).byte().numpy()
+    size = (max(SIZE, round(h * sc)), max(SIZE, round(w * sc)))
+    planes = [x[:, None, :h], x[:, h:h + h // 4].reshape(-1, 1, h // 2, w // 2), x[:, h + h // 4:].reshape(-1, 1, h // 2, w // 2)]
+    y, u, v = (F.interpolate(p, size=size, mode="bilinear", antialias=True)[:, 0, top:top + SIZE, left:left + SIZE].round()
+               for p in planes)
+    yy, s, u, v = (y - 16) * 255 / 219, 255 / 224, u - 128, v - 128
+    rgb = torch.stack([yy + 1.5748 * s * v, yy - 0.187324 * s * u - 0.468124 * s * v, yy + 1.8556 * s * u], 1)
+    return rgb.round().clamp(0, 255).byte().numpy()
 
 
 def test_index_matches_moov(shards):

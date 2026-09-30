@@ -3,7 +3,8 @@
 // Python plans each request (which bytes, which frames, which crop) from the shard index and calls
 // kc_decode once per batch. Everything per frame happens here, in parallel (OpenMP), with no Python
 // and no GIL: pread of each GOP range, decode with a persistent per-thread decoder, and either
-//   RGB mode: antialiased bilinear resize to (nh, nw) fused with the (oh, ow) crop + flips -> CHW, or
+//   RGB mode: antialiased bilinear resize of each YUV plane to (nh, nw) fused with the (oh, ow)
+//             crop, then conversion of the output pixels + flips -> CHW, or
 //   YUV mode: the stored-resolution (oh, ow) window of the Y/U/V planes (resize happens on the GPU).
 // Codecs: H.264 / HEVC (libavcodec), AV1 (libdav1d through libavcodec).
 #include <algorithm>
@@ -47,7 +48,7 @@ struct Request {
 // ------------------------------------------------------------------ profiling (per stage, all threads)
 enum Stage { READ, DECODE, CONVERT, RESIZE, NSTAGE };
 static std::atomic<int64_t> g_ns[NSTAGE];
-static std::atomic<int64_t> g_frames{0};
+static std::atomic<int64_t> g_frames{0}, g_decoded{0};  // frames emitted / decoded
 struct Timer {
   Stage s; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
   explicit Timer(Stage st) : s(st) {}
@@ -55,9 +56,9 @@ struct Timer {
 };
 
 // ------------------------------------------------------------------ antialiased resize fused with crop
-// Same filter as torch.nn.functional.interpolate(mode="bilinear", antialias=True) / PIL BILINEAR:
-// the stored frame is conceptually resized to (nh, nw); only the (oh, ow) crop is produced, reading
-// only the source window it needs. Q14 weights, uint8 intermediates, two separable passes.
+// Same filter as torch.nn.functional.interpolate(mode="bilinear", antialias=True) / PIL BILINEAR,
+// applied per YUV plane before color conversion (so only output pixels are converted). Q14 weights,
+// uint8 intermediates, two separable passes.
 struct Taps { std::vector<int> x0, n; std::vector<int16_t> w; int maxn; };
 
 static void make_taps(int in, int out, int out0, int outn, Taps& t) {
@@ -88,103 +89,59 @@ static inline void weighted_rows(const uint8_t* const* rows, const int16_t* wt, 
   for (int x = 0; x < len; ++x) dst[x] = (uint8_t)std::clamp(a[x] >> 14, 0, 255);
 }
 
-// source window [x0, x1) x [y0, y1) of an (h, w) stored frame that the crop needs
-static void source_window(const Request& r, int h, int w, int& x0, int& x1, int& y0, int& y1) {
-  if (r.nh == h && r.nw == w) { x0 = r.left; x1 = r.left + r.ow; y0 = r.top; y1 = r.top + r.oh; return; }
-  const double sx = (double)w / r.nw, sy = (double)h / r.nh;
-  x0 = std::max(0, (int)std::floor(r.left * sx - sx - 1)); x1 = std::min(w, (int)std::ceil((r.left + r.ow) * sx + sx + 1));
-  y0 = std::max(0, (int)std::floor(r.top * sy - sy - 1));  y1 = std::min(h, (int)std::ceil((r.top + r.oh) * sy + sy + 1));
+// dst[x][y] = src[y][x] for an (h, w) uint8 matrix, 32 x 32 blocks
+static void transpose(const uint8_t* src, int h, int w, uint8_t* dst) {
+  for (int yb = 0; yb < h; yb += 32)
+    for (int xb = 0; xb < w; xb += 32)
+      for (int x = xb; x < std::min(xb + 32, w); ++x)
+        for (int y = yb; y < std::min(yb + 32, h); ++y) dst[(size_t)x * h + y] = src[(size_t)y * w + x];
 }
 
-// rgb: HWC window [x0, ..) x [y0, ..) of an (h, w) frame -> CHW crop with flips
-static void resize_crop(const uint8_t* rgb, int stride, int x0, int y0, int h, int w, const Request& r, uint8_t* out) {
-  Timer t(RESIZE);
-  const int oh = r.oh, ow = r.ow, plane = oh * ow;
-  if (r.nh == h && r.nw == w) {  // no resize: plain crop
-    for (int y = 0; y < oh; ++y) {
-      const uint8_t* row = rgb + (size_t)(r.top + y - y0) * stride + (size_t)(r.left - x0) * 3;
-      uint8_t* R = out + (size_t)(r.vflip ? oh - 1 - y : y) * ow; uint8_t* G = R + plane; uint8_t* B = G + plane;
-      for (int x = 0; x < ow; ++x) { const int o = r.hflip ? ow - 1 - x : x; R[o] = row[3 * x]; G[o] = row[3 * x + 1]; B[o] = row[3 * x + 2]; }
-    }
-    return;
-  }
+// One plane, conceptually resized to (nh, nw) (antialiased), cropped to (oh, ow) at (top, left):
+// vertical pass over the needed rows, transpose, horizontal pass as a vertical pass, transpose.
+// Only the source window the crop needs is read. Chroma planes use the same call: their taps map
+// the smaller plane straight onto the output grid (centered siting falls out of the geometry).
+static void resize_plane(const uint8_t* src, int stride, int ph, int pw, const Request& r, uint8_t* dst) {
   thread_local Taps tx, ty;
-  thread_local std::vector<uint8_t> vert, planar, horiz;
-  make_taps(w, r.nw, r.left, ow, tx); make_taps(h, r.nh, r.top, oh, ty);
+  thread_local std::vector<uint8_t> vert, cols, horiz;
+  const int oh = r.oh, ow = r.ow;
+  make_taps(pw, r.nw, r.left, ow, tx); make_taps(ph, r.nh, r.top, oh, ty);
   const int xs = tx.x0[0], win = tx.x0[ow - 1] + tx.n[ow - 1] - xs;
   const uint8_t* rows[64];
-  // 1) vertical pass on interleaved rows: [oh][win * 3]
-  vert.resize((size_t)oh * win * 3);
+  vert.resize((size_t)oh * win);
   for (int y = 0; y < oh; ++y) {
-    for (int j = 0; j < ty.n[y]; ++j) rows[j] = rgb + (size_t)(ty.x0[y] + j - y0) * stride + (size_t)(xs - x0) * 3;
-    weighted_rows(rows, ty.w.data() + (size_t)y * ty.maxn, ty.n[y], win * 3, vert.data() + (size_t)y * win * 3);
+    for (int j = 0; j < ty.n[y]; ++j) rows[j] = src + (size_t)(ty.x0[y] + j) * stride + xs;
+    weighted_rows(rows, ty.w.data() + (size_t)y * ty.maxn, ty.n[y], win, vert.data() + (size_t)y * win);
   }
-  // 2) transpose to planar column-major [3][win][oh] (32 x 32 blocks)
-  planar.resize((size_t)3 * win * oh);
-  for (int yb = 0; yb < oh; yb += 32)
-    for (int xb = 0; xb < win; xb += 32)
-      for (int c = 0; c < 3; ++c)
-        for (int x = xb; x < std::min(xb + 32, win); ++x) {
-          uint8_t* d = planar.data() + ((size_t)c * win + x) * oh;
-          for (int y = yb; y < std::min(yb + 32, oh); ++y) d[y] = vert[(size_t)y * win * 3 + 3 * x + c];
-        }
-  // 3) horizontal pass, done as a contiguous pass over columns: [3][ow][oh]
-  horiz.resize((size_t)3 * ow * oh);
-  for (int c = 0; c < 3; ++c)
-    for (int x = 0; x < ow; ++x) {
-      for (int j = 0; j < tx.n[x]; ++j) rows[j] = planar.data() + ((size_t)c * win + tx.x0[x] + j - xs) * oh;
-      weighted_rows(rows, tx.w.data() + (size_t)x * tx.maxn, tx.n[x], oh, horiz.data() + ((size_t)c * ow + x) * oh);
-    }
-  // 4) transpose back to CHW with flips (32 x 32 blocks)
-  for (int c = 0; c < 3; ++c) {
-    const uint8_t* src = horiz.data() + (size_t)c * ow * oh; uint8_t* dst = out + (size_t)c * plane;
-    for (int yb = 0; yb < oh; yb += 32)
-      for (int xb = 0; xb < ow; xb += 32)
-        for (int y = yb; y < std::min(yb + 32, oh); ++y) {
-          uint8_t* d = dst + (size_t)(r.vflip ? oh - 1 - y : y) * ow;
-          for (int x = xb; x < std::min(xb + 32, ow); ++x) d[r.hflip ? ow - 1 - x : x] = src[(size_t)x * oh + y];
-        }
+  cols.resize((size_t)win * oh);
+  transpose(vert.data(), oh, win, cols.data());
+  horiz.resize((size_t)ow * oh);
+  for (int x = 0; x < ow; ++x) {
+    for (int j = 0; j < tx.n[x]; ++j) rows[j] = cols.data() + (size_t)(tx.x0[x] + j - xs) * oh;
+    weighted_rows(rows, tx.w.data() + (size_t)x * tx.maxn, tx.n[x], oh, horiz.data() + (size_t)x * oh);
   }
+  transpose(horiz.data(), ow, oh, dst);
 }
 
-// YUV window [x0, x1) x [y0, y1) -> interleaved RGB; 4:2:0 with centered bilinear chroma, or 4:4:4
-static void yuv_to_rgb(const AVFrame* f, int x0, int x1, int y0, int y1, uint8_t* rgb) {
-  Timer t(CONVERT);
+// Y, U, V at output resolution -> RGB CHW with flips (BT.601 / BT.709, limited or full range)
+static void to_rgb(const uint8_t* Y, const uint8_t* U, const uint8_t* V, const AVFrame* f, const Request& r, uint8_t* out) {
   const bool full = f->color_range == AVCOL_RANGE_JPEG, bt709 = f->colorspace == AVCOL_SPC_BT709;
-  const bool sub = f->format != AV_PIX_FMT_YUV444P && f->format != AV_PIX_FMT_YUVJ444P;
-  const uint8_t *Y = f->data[0], *U = f->data[1], *V = f->data[2];
-  const int ys = f->linesize[0], cs = f->linesize[1], w = f->width, h = f->height, rw = x1 - x0;
   const int ky = full ? 16384 : 19077, yoff = full ? 0 : 16;
   const double s = full ? 1.0 : 255.0 / 224.0;
   const double cr = bt709 ? 1.5748 : 1.402, cgu = bt709 ? -0.187324 : -0.344136, cgv = bt709 ? -0.468124 : -0.714136, cb = bt709 ? 1.8556 : 1.772;
   const int kr = (int)(cr * s * 16384 + .5), kgu = (int)(cgu * s * 16384 - .5), kgv = (int)(cgv * s * 16384 - .5), kb = (int)(cb * s * 16384 + .5);
-  thread_local std::vector<int32_t> uu, vv, pu, pv;
-  uu.resize(rw); vv.resize(rw);
-  const int cw = (w + 1) / 2, chh = (h + 1) / 2;
-  const int c_lo = std::max(0, (x0 >> 1) - 1), c_hi = std::min(cw - 1, (x1 >> 1) + 1), nc = c_hi - c_lo + 1;
-  pu.resize(nc + 2); pv.resize(nc + 2);
-  for (int yy = y0; yy < y1; ++yy) {
-    if (!sub) {
-      for (int x = 0; x < rw; ++x) { uu[x] = (U[(size_t)yy * cs + x0 + x] - 128) * 16; vv[x] = (V[(size_t)yy * cs + x0 + x] - 128) * 16; }
-    } else {  // vertical 3:1 / 1:3 taps (centered chroma siting), then horizontal
-      const int cy2 = 2 * yy - 1, c0 = cy2 < 0 ? 0 : cy2 >> 2, fy = cy2 < 0 ? 0 : cy2 & 3, c1 = std::min(c0 + 1, chh - 1);
-      const uint8_t *U0 = U + (size_t)c0 * cs + c_lo, *U1 = U + (size_t)c1 * cs + c_lo, *V0 = V + (size_t)c0 * cs + c_lo, *V1 = V + (size_t)c1 * cs + c_lo;
-      int32_t *qu = pu.data() + 1, *qv = pv.data() + 1;
-      for (int k = 0; k < nc; ++k) { qu[k] = U0[k] * (4 - fy) + U1[k] * fy; qv[k] = V0[k] * (4 - fy) + V1[k] * fy; }
-      qu[-1] = qu[0]; qv[-1] = qv[0]; qu[nc] = qu[nc - 1]; qv[nc] = qv[nc - 1];
-      for (int x = 0; x < rw; ++x) {
-        const int xx = x0 + x, k = (xx >> 1) - c_lo, odd = xx & 1;
-        const int a = odd ? k : k - 1, b = odd ? k + 1 : k, wa = odd ? 3 : 1, wb = odd ? 1 : 3;
-        uu[x] = qu[a] * wa + qu[b] * wb - 128 * 16; vv[x] = qv[a] * wa + qv[b] * wb - 128 * 16;
-      }
-      if (x0 == 0) { uu[0] = qu[0] * 4 - 128 * 16; vv[0] = qv[0] * 4 - 128 * 16; }
-    }
-    const uint8_t* Yr = Y + (size_t)yy * ys + x0; uint8_t* o = rgb + (size_t)(yy - y0) * rw * 3;
-    for (int x = 0; x < rw; ++x) {
-      const int yv = (Yr[x] - yoff) * ky * 16;
-      o[3 * x] = (uint8_t)std::clamp((yv + kr * vv[x] + 131072) >> 18, 0, 255);
-      o[3 * x + 1] = (uint8_t)std::clamp((yv + kgu * uu[x] + kgv * vv[x] + 131072) >> 18, 0, 255);
-      o[3 * x + 2] = (uint8_t)std::clamp((yv + kb * uu[x] + 131072) >> 18, 0, 255);
+  const int oh = r.oh, ow = r.ow;
+  const size_t plane = (size_t)oh * ow;
+  for (int y = 0; y < oh; ++y) {
+    const size_t i = (size_t)y * ow;
+    uint8_t* R = out + (size_t)(r.vflip ? oh - 1 - y : y) * ow;
+    uint8_t *G = R + plane, *B = G + plane;
+    for (int x = 0; x < ow; ++x) {
+      const int yv = (Y[i + x] - yoff) * ky * 16, u = (U[i + x] - 128) * 16, v = (V[i + x] - 128) * 16;
+      const int o = r.hflip ? ow - 1 - x : x;
+      R[o] = (uint8_t)std::clamp((yv + kr * v + 131072) >> 18, 0, 255);
+      G[o] = (uint8_t)std::clamp((yv + kgu * u + kgv * v + 131072) >> 18, 0, 255);
+      B[o] = (uint8_t)std::clamp((yv + kb * u + 131072) >> 18, 0, 255);
     }
   }
 }
@@ -204,7 +161,7 @@ struct Decoders {
   AVCodecContext* video[3] = {};
   AVPacket* pkt = av_packet_alloc();
   AVFrame* frame = av_frame_alloc();
-  std::vector<uint8_t> bytes, rgb;
+  std::vector<uint8_t> bytes, planes;
   ~Decoders() {
     for (auto& c : video) if (c) avcodec_free_context(&c);
     av_packet_free(&pkt); av_frame_free(&frame);
@@ -233,16 +190,22 @@ static bool read_range(int fd, int64_t off, size_t n, std::vector<uint8_t>& buf,
   return true;
 }
 
-// write the wanted frame `f` (display index idx) into its output slot
+// write the wanted frame `f` into its output slot
 static void emit(const Request& r, const AVFrame* f, int slot) {
   ++g_frames;
   if (r.mode == YUV) { copy_window(f, r, r.out + (size_t)slot * r.oh * r.ow * 3 / 2); return; }
-  int x0, x1, y0, y1;
-  source_window(r, f->height, f->width, x0, x1, y0, y1);
-  x0 &= ~1;
-  D.rgb.resize((size_t)(x1 - x0) * (y1 - y0) * 3);
-  yuv_to_rgb(f, x0, x1, y0, y1, D.rgb.data());
-  resize_crop(D.rgb.data(), (x1 - x0) * 3, x0, y0, f->height, f->width, r, r.out + (size_t)slot * 3 * r.oh * r.ow);
+  const size_t plane = (size_t)r.oh * r.ow;
+  D.planes.resize(3 * plane);
+  const bool sub = f->format != AV_PIX_FMT_YUV444P && f->format != AV_PIX_FMT_YUVJ444P;
+  const int ch = sub ? (f->height + 1) / 2 : f->height, cw = sub ? (f->width + 1) / 2 : f->width;
+  {
+    Timer t(RESIZE);
+    resize_plane(f->data[0], f->linesize[0], f->height, f->width, r, D.planes.data());
+    resize_plane(f->data[1], f->linesize[1], ch, cw, r, D.planes.data() + plane);
+    resize_plane(f->data[2], f->linesize[2], ch, cw, r, D.planes.data() + 2 * plane);
+  }
+  Timer t(CONVERT);
+  to_rgb(D.planes.data(), D.planes.data() + plane, D.planes.data() + 2 * plane, f, r, r.out + (size_t)slot * 3 * plane);
 }
 
 // mp4 H.264 / HEVC samples are length-prefixed NAL units (4-byte lengths); the decoder takes Annex B:
@@ -291,6 +254,7 @@ static int decode_video(const Request& r) {
         int got;
         { Timer t(DECODE); got = avcodec_receive_frame(ctx, D.frame); }
         if (got < 0) break;
+        ++g_decoded;
         const int idx = (int)D.frame->pts;
         const int* w = std::lower_bound(r.want, r.want + r.nwant, idx);
         if (w != r.want + r.nwant && *w == idx) { emit(r, D.frame, (int)(w - r.want)); ++emitted; }
@@ -313,10 +277,12 @@ int kc_decode(const Request* reqs, int n, int threads, int32_t* status) {
   }
   return bad;
 }
-// Cumulative per-stage time (ns: read, decode, convert, resize) and frames emitted; reset if asked.
+// Cumulative per-stage time (ns: read, decode, convert, resize) and frames [emitted, decoded];
+// reset if asked.
 void kc_profile(int64_t* ns, int64_t* frames, int reset) {
   for (int s = 0; s < NSTAGE; ++s) ns[s] = reset ? g_ns[s].exchange(0) : g_ns[s].load();
-  *frames = reset ? g_frames.exchange(0) : g_frames.load();
+  frames[0] = reset ? g_frames.exchange(0) : g_frames.load();
+  frames[1] = reset ? g_decoded.exchange(0) : g_decoded.load();
 }
 int kc_request_size() { return (int)sizeof(Request); }
 }
