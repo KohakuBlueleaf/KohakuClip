@@ -1,4 +1,5 @@
-"""ctypes binding of the native core (native/kc.cpp). One call decodes a whole batch without the GIL."""
+"""ctypes binding of the native core (native/kc.cpp): batches are queued on a persistent native thread
+pool (``submit``) and collected with ``wait``, which blocks without holding the GIL."""
 
 import ctypes as C
 import glob
@@ -14,7 +15,8 @@ STAGES = ("read", "decode", "convert", "resize")
 class Request(C.Structure):
     _fields_ = [
         ("fd", C.c_int32), ("codec", C.c_int32), ("mode", C.c_int32), ("ngroups", C.c_int32),
-        ("group_off", C.c_void_p), ("group_npk", C.c_void_p), ("pk_len", C.c_void_p), ("pk_idx", C.c_void_p),
+        ("group_off", C.c_void_p), ("group_len", C.c_void_p), ("group_npk", C.c_void_p), ("pk_off", C.c_void_p),
+        ("pk_len", C.c_void_p), ("pk_idx", C.c_void_p),
         ("prefix", C.c_void_p), ("nprefix", C.c_int32), ("nwant", C.c_int32), ("want", C.c_void_p),
         ("nh", C.c_int32), ("nw", C.c_int32), ("top", C.c_int32), ("left", C.c_int32),
         ("oh", C.c_int32), ("ow", C.c_int32), ("hflip", C.c_int32), ("vflip", C.c_int32), ("out", C.c_void_p),
@@ -27,8 +29,9 @@ def _load() -> C.CDLL:
     if not found:
         raise ImportError("kohakuclip native core not built (pip install -e . or python -m kohakuclip.build)")
     lib = C.CDLL(found[0])
-    lib.kc_decode.argtypes = [C.POINTER(Request), C.c_int, C.c_int, C.c_void_p]
-    lib.kc_decode.restype = C.c_int
+    lib.kc_submit.argtypes = [C.POINTER(Request), C.c_int, C.c_int, C.c_void_p]
+    lib.kc_submit.restype = C.c_void_p
+    lib.kc_wait.argtypes = [C.c_void_p]
     lib.kc_profile.argtypes = [C.c_void_p, C.c_void_p, C.c_int]
     if lib.kc_request_size() != C.sizeof(Request):
         raise ImportError("kohakuclip native core ABI mismatch; rebuild it")
@@ -38,12 +41,20 @@ def _load() -> C.CDLL:
 _lib = _load()
 
 
-def decode(requests: list[Request], threads: int) -> np.ndarray:
-    """Decode a batch of requests in parallel; returns the per-request status (0 = ok)."""
-    arr = (Request * len(requests))(*requests)
-    status = np.zeros(len(requests), np.int32)
-    _lib.kc_decode(arr, len(requests), threads, status.ctypes.data)
-    return status
+class Job:
+    """A queued batch; keeps its request array alive until ``wait``."""
+
+    def __init__(self, requests: list[Request], threads: int):
+        self.requests = (Request * len(requests))(*requests)
+        self.status = np.zeros(len(requests), np.int32)
+        self.handle = _lib.kc_submit(self.requests, len(requests), threads, self.status.ctypes.data)
+
+    def wait(self) -> np.ndarray:
+        """Block until decoded; returns the per-request status (0 = ok)."""
+        if self.handle is not None:
+            _lib.kc_wait(self.handle)
+            self.handle = None
+        return self.status
 
 
 def profile(reset: bool = False) -> dict:

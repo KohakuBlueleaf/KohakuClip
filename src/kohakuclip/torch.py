@@ -8,6 +8,7 @@ The native decode releases the GIL, so one background thread with ``Reader(threa
 without DataLoader worker processes, pickling or collation.
 """
 
+import collections
 import queue
 import random
 import threading
@@ -49,16 +50,18 @@ def yuv_to_rgb(batch: Batch, size: int, device: torch.device | str = "cuda") -> 
 
 
 class Loader:
-    """Iterates batches decoded by ``reader`` on a background thread, ``prefetch`` batches ahead.
+    """Iterates batches decoded by ``reader`` on a background thread: ``inflight`` batches queued on
+    the native pool at once (planning overlaps decoding, no per-batch barrier), ``prefetch`` finished
+    batches buffered.
 
     ``sample(rng) -> (video id, frame indices)`` chooses each clip. RGB batches come back as pinned
     uint8 tensors; YUV batches as ``Batch`` objects for ``yuv_to_rgb``.
     """
 
-    def __init__(self, reader: Reader, sample, batch_size: int, prefetch: int = 2, steps: int | None = None,
-                 seed: int = 0, pin: bool = True):
+    def __init__(self, reader: Reader, sample, batch_size: int, prefetch: int = 2, inflight: int = 2,
+                 steps: int | None = None, seed: int = 0, pin: bool = True):
         self.reader, self.sample, self.batch_size = reader, sample, batch_size
-        self.steps, self.pin = steps, pin
+        self.steps, self.pin, self.inflight = steps, pin, inflight
         self.rng = random.Random(seed)
         self.queue: queue.Queue = queue.Queue(maxsize=prefetch)
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -72,17 +75,22 @@ class Loader:
         return buf
 
     def _run(self):
+        pending = collections.deque()  # batches in flight on the native pool
         step = 0
-        while self.steps is None or step < self.steps:
-            items = [self.sample(self.rng) for _ in range(self.batch_size)]
-            buf = self._buffer(len(items[0][1]))
-            try:
-                batch = self.reader.read(items, None if buf is None else buf.numpy())
-            except Exception as e:  # surface decode errors in the consumer
-                self.queue.put(e)
-                return
-            self.queue.put(buf if buf is not None else batch)
-            step += 1
+        try:
+            while self.steps is None or step < self.steps or pending:
+                if self.steps is None or step < self.steps:
+                    items = [self.sample(self.rng) for _ in range(self.batch_size)]
+                    buf = self._buffer(len(items[0][1]))
+                    pending.append((self.reader.submit(items, None if buf is None else buf.numpy()), buf))
+                    step += 1
+                if len(pending) > self.inflight or (self.steps is not None and step >= self.steps):
+                    job, buf = pending.popleft()
+                    batch = job.result()
+                    self.queue.put(buf if buf is not None else batch)
+        except Exception as e:  # surface decode errors in the consumer
+            self.queue.put(e)
+            return
         self.queue.put(None)
 
     def __iter__(self):

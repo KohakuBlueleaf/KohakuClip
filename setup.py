@@ -27,8 +27,8 @@ setup(
             include_dirs=include,
             library_dirs=lib,
             libraries=["avcodec", "avutil"],
-            extra_compile_args=["-O3", "-std=c++17", "-fopenmp", f"-march={os.environ.get('KOHAKUCLIP_MARCH', 'native')}"],
-            extra_link_args=["-fopenmp"] + [f"-Wl,-rpath,{d}" for d in lib],
+            extra_compile_args=["-O3", "-std=c++17", "-pthread", f"-march={os.environ.get('KOHAKUCLIP_MARCH', 'native')}"],
+            extra_link_args=["-pthread"] + [f"-Wl,-rpath,{d}" for d in lib],
             language="c++",
         )
     ]

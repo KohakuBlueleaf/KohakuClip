@@ -1,7 +1,7 @@
 // KohakuClip native core: read + decode + resize/crop of training clips, batched and threaded.
 //
 // Python plans each request (which bytes, which frames, which crop) from the shard index and calls
-// kc_decode once per batch. Everything per frame happens here, in parallel (OpenMP), with no Python
+// kc_submit per batch. Everything per frame happens here, on a persistent thread pool, with no Python
 // and no GIL: pread of each GOP range, decode with a persistent per-thread decoder, and either
 //   RGB mode: antialiased bilinear resize of each YUV plane to (nh, nw) fused with the (oh, ow)
 //             crop, then conversion of the output pixels + flips -> CHW, or
@@ -11,11 +11,15 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <unistd.h>
-#include <omp.h>
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
@@ -29,8 +33,10 @@ enum Mode : int32_t { RGB = 0, YUV = 1 };
 struct Request {
   int32_t fd, codec, mode;
   int32_t ngroups;
-  const int64_t* group_off;   // [ngroups] byte offset of each group in the file
-  const int32_t* group_npk;   // [ngroups] packets per group (contiguous bytes)
+  const int64_t* group_off;   // [ngroups] byte range of each group in the file (keyframe first)
+  const int64_t* group_len;
+  const int32_t* group_npk;   // [ngroups] packets fed per group (unwanted skippable ones left out)
+  const int64_t* pk_off;      // [sum npk] packet offset within its group's range
   const int32_t* pk_len;      // [sum npk] packet sizes
   const int32_t* pk_idx;      // [sum npk] display index of each packet
   const uint8_t* prefix;      // prepended to each group's first packet: AV1 sequence header, or
@@ -227,23 +233,21 @@ static int decode_video(const Request& r) {
   int pk = 0, emitted = 0;
   for (int g = 0; g < r.ngroups; ++g) {
     const int npk = r.group_npk[g];
-    size_t total = r.nprefix;
-    for (int i = 0; i < npk; ++i) total += r.pk_len[pk + i];
-    D.bytes.resize(total);
+    // [prefix][group range]: the prefix sits right before the keyframe (offset 0), which it joins
+    D.bytes.resize(r.nprefix);
     if (r.nprefix) memcpy(D.bytes.data(), r.prefix, r.nprefix);
-    if (!read_range(r.fd, r.group_off[g], total - r.nprefix, D.bytes, r.nprefix)) return -2;
+    if (!read_range(r.fd, r.group_off[g], r.group_len[g], D.bytes, r.nprefix)) return -2;
     avcodec_flush_buffers(ctx);
-    size_t at = 0;
     for (int i = 0; i <= npk; ++i) {
       int sent;
       {
         Timer t(DECODE);
         if (i < npk) {
-          const size_t len = r.pk_len[pk + i] + (i == 0 ? r.nprefix : 0);
-          if (r.codec != AV1 && !to_annexb(D.bytes.data() + at + (i == 0 ? r.nprefix : 0), r.pk_len[pk + i])) return -3;
+          uint8_t* data = D.bytes.data() + r.nprefix + r.pk_off[pk + i];
+          if (r.codec != AV1 && !to_annexb(data, r.pk_len[pk + i])) return -3;
+          const int head = i == 0 ? r.nprefix : 0;
           av_packet_unref(D.pkt);
-          D.pkt->data = D.bytes.data() + at; D.pkt->size = (int)len; D.pkt->pts = r.pk_idx[pk + i];
-          at += len;
+          D.pkt->data = data - head; D.pkt->size = r.pk_len[pk + i] + head; D.pkt->pts = r.pk_idx[pk + i];
           sent = avcodec_send_packet(ctx, D.pkt);
         } else {
           sent = avcodec_send_packet(ctx, nullptr);  // drain the group
@@ -266,16 +270,74 @@ static int decode_video(const Request& r) {
   return emitted == r.nwant ? 0 : -4;
 }
 
-extern "C" {
-// Decode a batch; per-request status in `status` (0 = ok). Returns the number of failed requests.
-int kc_decode(const Request* reqs, int n, int threads, int32_t* status) {
-  int bad = 0;
-#pragma omp parallel for num_threads(std::max(threads, 1)) schedule(dynamic, 1) reduction(+ : bad)
-  for (int i = 0; i < n; ++i) {
-    status[i] = decode_video(reqs[i]);
-    bad += status[i] != 0;
+// ------------------------------------------------------------------ persistent pool
+// Requests of all submitted batches share one FIFO queue, so a thread that finishes early starts on
+// the next batch instead of waiting at a per-batch barrier. Each thread keeps its decoders (D).
+struct Job {
+  const Request* reqs;
+  int32_t* status;
+  std::atomic<int> left;
+  std::mutex m;
+  std::condition_variable done;
+};
+
+class Pool {
+ public:
+  explicit Pool(int n) {
+    for (int i = 0; i < n; ++i) workers_.emplace_back([this] { run(); });
   }
-  return bad;
+  ~Pool() {  // finishes the queued requests first
+    { std::lock_guard<std::mutex> g(m_); stop_ = true; }
+    ready_.notify_all();
+    for (auto& t : workers_) t.join();
+  }
+  void submit(Job* job, int n) {
+    { std::lock_guard<std::mutex> g(m_); for (int i = 0; i < n; ++i) queue_.emplace_back(job, i); }
+    ready_.notify_all();
+  }
+
+ private:
+  void run() {
+    for (;;) {
+      std::pair<Job*, int> task;
+      {
+        std::unique_lock<std::mutex> l(m_);
+        ready_.wait(l, [this] { return stop_ || !queue_.empty(); });
+        if (queue_.empty()) return;
+        task = queue_.front();
+        queue_.pop_front();
+      }
+      auto [job, i] = task;
+      job->status[i] = decode_video(job->reqs[i]);
+      if (--job->left == 0) { std::lock_guard<std::mutex> g(job->m); job->done.notify_all(); }
+    }
+  }
+  std::vector<std::thread> workers_;
+  std::deque<std::pair<Job*, int>> queue_;
+  std::mutex m_;
+  std::condition_variable ready_;
+  bool stop_ = false;
+};
+
+static std::unique_ptr<Pool> g_pool;
+static int g_threads = 0;
+
+extern "C" {
+// Queue a batch (the arrays must stay alive until kc_wait); returns a handle. `threads` sizes the
+// pool (resized only when it changes).
+void* kc_submit(const Request* reqs, int n, int threads, int32_t* status) {
+  threads = std::max(threads, 1);
+  if (threads != g_threads) { g_pool.reset(); g_pool = std::make_unique<Pool>(threads); g_threads = threads; }
+  Job* job = new Job{reqs, status, {n}, {}, {}};
+  if (n == 0) return job;
+  g_pool->submit(job, n);
+  return job;
+}
+// Block until the batch is decoded (per-request status in the submitted `status`), free the handle.
+void kc_wait(void* handle) {
+  Job* job = static_cast<Job*>(handle);
+  { std::unique_lock<std::mutex> l(job->m); job->done.wait(l, [job] { return job->left == 0; }); }
+  delete job;
 }
 // Cumulative per-stage time (ns: read, decode, convert, resize) and frames [emitted, decoded];
 // reset if asked.

@@ -22,7 +22,8 @@ import numpy as np
 INDEX = "__index__.bin"
 MAGIC = b"KCIDX1\0\0"
 FRAME = np.dtype([("off", "<i8"), ("size", "<i4"), ("flags", "u1"), ("pad", "u1", (3,))])
-KEY = 1  # flags bit 0: keyframe (closed-GOP start)
+KEY = 1   # flags bit 0: keyframe (closed-GOP start)
+SKIP = 2  # flags bit 1: nothing later depends on this sample (AV1 top-layer frame): skip unless wanted
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Video:
     off: np.ndarray       # [n] absolute byte offset of each frame in the shard
     size: np.ndarray      # [n] bytes
     keys: np.ndarray      # sorted keyframe indices
+    skip: np.ndarray | None = None  # [n] bool, samples that may be left out when not wanted
     prefix: bytes = b""   # prepended to each GOP's first packet (see ``codec_prefix``)
     colorspace: str = "bt709"
 
@@ -80,8 +82,8 @@ class Shard:
         m = self.meta[i]
         fr = self.frames[m["row"]:m["row"] + m["n"]]
         return Video(m["n"], m["fps"], m["h"], m["w"], m["codec"], fr["off"], fr["size"],
-                     np.flatnonzero(fr["flags"] & KEY), bytes.fromhex(m.get("prefix", "")),
-                     m.get("colorspace", "bt709"))
+                     np.flatnonzero(fr["flags"] & KEY), (fr["flags"] & SKIP) != 0,
+                     bytes.fromhex(m.get("prefix", "")), m.get("colorspace", "bt709"))
 
     def _parse_moov(self, i: int) -> Video:
         _, header_offset = self.members[i]
@@ -195,4 +197,4 @@ def parse_moov(buf, base: int) -> Video:
     tag = {"av1": b"av1C", "h264": b"avcC", "hevc": b"hvcC"}[codec]
     j = entry.find(tag)
     prefix = codec_prefix(codec, entry[j + 4:j - 4 + struct.unpack(">I", entry[j - 4:j])[0]])
-    return Video(n, float(fps), h, w, codec, off, size, np.asarray(keys, np.int64), prefix)
+    return Video(n, float(fps), h, w, codec, off, size, np.asarray(keys, np.int64), None, prefix)

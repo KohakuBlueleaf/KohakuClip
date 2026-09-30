@@ -94,3 +94,13 @@ def test_moov_fallback_is_bit_identical(shards):
         s.meta = None
     b = Reader(fallback, size=SIZE, augment=Augment(crop="center")).read(items).video
     assert np.array_equal(a, b)
+
+
+def test_skipping_unreferenced_samples_is_exact(shards):
+    reader = Reader(shards, size=SIZE, threads=4, augment=Augment(crop="center"))
+    rng = random.Random(1)
+    items = [(vid, clip(reader.info(vid).n, reader.info(vid).fps, 8, 6.0, rng)) for vid in range(len(reader))]
+    items += [(vid, random_frames(reader.info(vid).n, 8, rng)) for vid in range(len(reader))]
+    fast = reader.read(items).video
+    reader.skip = False
+    assert np.array_equal(fast, reader.read(items).video)

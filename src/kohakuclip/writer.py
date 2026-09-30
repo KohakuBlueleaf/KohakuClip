@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from .shard import FRAME, INDEX, KEY, MAGIC, codec_prefix, data_offset
+from .shard import FRAME, INDEX, KEY, MAGIC, SKIP, codec_prefix, data_offset
 
 
 @dataclass
@@ -68,6 +68,12 @@ def frame_table(path: str) -> tuple[list, dict]:
         prefix = codec_prefix(codec, bytes(ctx.extradata or b"")).hex()
         meta = dict(n=len(rows), fps=float(s.average_rate or s.guessed_rate), h=ctx.height, w=ctx.width,
                     codec=codec, prefix=prefix, colorspace="bt709")
+    if codec == "av1":  # flag samples nothing depends on (see kohakuclip.av1)
+        from .av1 import skippable
+
+        with open(path, "rb") as f:
+            samples = [(f.seek(off), f.read(size))[1] for off, size, _ in rows]
+        rows = [(off, size, flags | (SKIP if s else 0)) for (off, size, flags), s in zip(rows, skippable(bytes.fromhex(prefix), samples))]
     return rows, meta
 
 
