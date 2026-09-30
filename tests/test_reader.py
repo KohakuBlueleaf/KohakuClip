@@ -203,3 +203,44 @@ def test_sources_agree(shards, tmp_path):
         outs[label] = reader.read(items).video
     for label, out in outs.items():
         assert np.array_equal(out, outs["zip"]), label
+
+
+def test_yuv_matches_rgb(shards):
+    """GPU-side conversion (run on the CPU here) of the stored-resolution yuv window vs rgb."""
+    from kohakuclip.torch import yuv_to_rgb
+
+    rgb = Reader(shards, size=SIZE, augment=Augment(crop="center"))
+    yuv = Reader(shards, size=SIZE, mode="yuv", augment=Augment(crop="center"))
+    same = [v for v in range(len(rgb)) if min(rgb.info(v).h, rgb.info(v).w) == 360]
+    items = [
+        (v, [0, 9, 30]) for v in same
+    ]  # "yuv" needs a common stored short side per batch
+    ref = torch.from_numpy(rgb.read(items).video).float()
+    got = (yuv_to_rgb(yuv.read(items), SIZE, device="cpu") + 1) * 127.5
+    psnr = 10 * np.log10(255**2 / ((got - ref) ** 2).mean().item())
+    assert psnr > 38, psnr
+
+
+def test_yuv_resized_planes(shards):
+    """yuv_resized planes == the yuv window's planes resized in torch (Y to the crop, U / V to half)."""
+    yuv = Reader(shards, size=SIZE, mode="yuv", augment=Augment(crop="center"))
+    small = Reader(
+        shards, size=SIZE, mode="yuv_resized", augment=Augment(crop="center")
+    )
+    same = [v for v in range(len(yuv)) if min(yuv.info(v).h, yuv.info(v).w) == 360]
+    items = [(v, [0, 9, 30]) for v in same]
+    a, b = yuv.read(items), small.read(items)
+    side, n = int(a.window[0][0]), len(items) * 3
+    x = torch.from_numpy(a.video).reshape(n, -1).float()
+    y = torch.from_numpy(b.video).reshape(n, -1).float()
+    for lo, hi, full, out in (
+        (0, side**2, side, SIZE),
+        (side**2, side**2 * 5 // 4, side // 2, SIZE // 2),
+    ):
+        plane = x[:, lo:hi].reshape(n, 1, full, full)
+        ref = F.interpolate(plane, size=(out, out), mode="bilinear", antialias=True)[
+            :, 0
+        ]
+        o = SIZE**2 if lo else 0
+        got = y[:, o : o + out * out].reshape(n, out, out)
+        assert (got - ref).abs().mean() < 1.0

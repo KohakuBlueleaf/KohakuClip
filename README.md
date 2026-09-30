@@ -75,10 +75,14 @@ the page cache).
 3. Batches queued back to back share one FIFO on the pool: no per-batch barrier, and planning
    overlaps decoding.
 
-`Reader(mode="yuv")` returns the stored-resolution crop window as YUV 4:2:0 instead, and
-`kohakuclip.torch.yuv_to_rgb` converts and resizes it on the GPU. Storage and disk reads are the
-same in both modes; only the host-to-GPU copy grows (a 512 x 512 window at 1.5 bytes per pixel vs
-a 256 x 256 RGB crop: 2x at 512p storage, about 230 vs 115 MB/s per GPU at 600 frames/s).
+Output modes (storage and disk reads are the same in all three; `kohakuclip.torch.yuv_to_rgb`
+finishes the yuv modes on the GPU):
+
+| `mode` | CPU per frame | host-to-GPU bytes / frame | GPU per frame | vs `rgb` |
+|---|---|---|---|---|
+| `"rgb"` (default) | resize + convert | 196,608 (256 x 256 x 3) | 4.5 us (copy) | - |
+| `"yuv_resized"`: planes resized to the crop, 4:2:0 | resize | 98,304 (0.5x) | 9.2 us | 43.2 dB (chroma at half the output resolution) |
+| `"yuv"`: stored-resolution window, 4:2:0 | none | 393,216 at 512p storage (2x) | 27.9 us | 48.7 dB |
 
 ## Measurements
 
@@ -105,9 +109,24 @@ hardware threads share cores, so per-core time rises.
 | AV1 in-loop filters off (writer) | -20 to -27 % decode, same size, same crop quality |
 | decode only what later frames need of unwanted samples (`skip=True`) | 8f@6 4.29 -> 3.27, 8 random 6.62 -> 5.12 (whole-unit skipping alone: 3.65 / 5.72); bit-exact |
 | resize YUV planes, then convert (vs convert, then resize) | 4.97 -> 4.22; the two agree at 48.4 dB (differ only at saturated edges) |
-| `mode="yuv"` (GPU converts + resizes) | CPU 3.94 -> 3.24 (8f@6), 2.27 -> 1.59 (8f@24); GPU +21 us/frame; host-to-GPU copy 2x at 512p storage; 48.7 dB vs rgb |
+| `mode="yuv"` / `"yuv_resized"` vs `"rgb"` (one job, another node) | 8f@6 3.52 -> 2.72 / 3.01, 8f@24 1.88 -> 1.41 / 1.65, 8 random 5.35 -> 4.44 / 4.82 |
 | threads, 2 batches in flight vs synchronous | 16 cores 5.04 -> 4.72, 24 cores 5.99 -> 4.53 (= separate processes) |
 | index vs moov fallback | within ~3 % |
+
+## In a training loop
+
+Measured in Foliation's pretraining (TT3D-B/16, 2 x B300, 16 clips per GPU, 8 frames @ 6 fps):
+
+| loader | it/s |
+|---|---|
+| tar of JPEG, 16 DataLoader workers per GPU | 7.20 |
+| KohakuClip in the training process, 8 threads | 7.02 |
+| KohakuClip in 1 DataLoader worker, 16 threads | 7.09 |
+| KohakuClip in 2 DataLoader workers, 8 threads each | 7.17 |
+
+Planning a batch holds the GIL for a few ms; in the training process that competes with a
+host-bound training step. Run the reader in one or two DataLoader workers (each a background
+`Loader`, handing one batch per step through shared memory) and pin in the main process.
 
 ## Build
 

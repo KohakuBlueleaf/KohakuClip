@@ -48,9 +48,13 @@ def yuv_to_rgb(
     bb = yy + 2 * (1 - kb) * u
     g = (yy - kr * r - kb * bb) / kg
     rgb = torch.cat([r, g, bb], 1).clamp_(0, 1)
-    rgb = F.interpolate(
-        rgb, size=(size, size), mode="bilinear", antialias=True, align_corners=False
-    )
+    if (h, w) != (
+        size,
+        size,
+    ):  # "yuv": stored-resolution window; "yuv_resized": already size
+        rgb = F.interpolate(
+            rgb, size=(size, size), mode="bilinear", antialias=True, align_corners=False
+        )
     rgb = rgb.view(b, t, 3, size, size)
     flips = torch.as_tensor(batch.flips, device=device).bool()
     rgb = torch.where(flips[:, 0].view(b, 1, 1, 1, 1), rgb.flip(-1), rgb)

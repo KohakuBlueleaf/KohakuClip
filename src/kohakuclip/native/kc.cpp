@@ -5,7 +5,8 @@
 // and no GIL: pread of each GOP range, decode with a persistent per-thread decoder, and either
 //   RGB mode: antialiased bilinear resize of each YUV plane to (nh, nw) fused with the (oh, ow)
 //             crop, then conversion of the output pixels + flips -> CHW, or
-//   YUV mode: the stored-resolution (oh, ow) window of the Y/U/V planes (resize happens on the GPU).
+//   YUV mode: the stored-resolution (oh, ow) window of the Y/U/V planes (resize happens on the GPU),
+//   YUV_RESIZED mode: the planes resized to the (oh, ow) crop, 4:2:0 (conversion on the GPU).
 // Codecs: H.264 / HEVC (libavcodec), AV1 (libdav1d through libavcodec).
 #include <algorithm>
 #include <atomic>
@@ -28,7 +29,7 @@ extern "C" {
 }
 
 enum Codec : int32_t { H264 = 0, HEVC = 1, AV1 = 2 };
-enum Mode : int32_t { RGB = 0, YUV = 1 };
+enum Mode : int32_t { RGB = 0, YUV = 1, YUV_RESIZED = 2 };
 
 struct Request {
   int32_t fd, codec, mode;
@@ -48,7 +49,7 @@ struct Request {
   int32_t top, left;          // RGB: crop origin in the resized frame; YUV: window origin (even)
   int32_t oh, ow;             // RGB: crop size; YUV: window size (even)
   int32_t hflip, vflip;       // RGB only
-  uint8_t* out;               // RGB: [nwant, 3, oh, ow]; YUV: [nwant, oh*ow*3/2] (Y, U, V planes)
+  uint8_t* out;               // RGB: [nwant, 3, oh, ow]; YUV*: [nwant, oh*ow*3/2] (Y, U, V planes)
 };
 
 // ------------------------------------------------------------------ profiling (per stage, all threads)
@@ -67,7 +68,9 @@ struct Timer {
 // uint8 intermediates, two separable passes.
 struct Taps { std::vector<int> x0, n; std::vector<int16_t> w; int maxn; };
 
-static void make_taps(int in, int out, int out0, int outn, Taps& t) {
+// taps for outputs out0 + [0, outn) of `in` samples resized to `out` (out, out0 may be fractional:
+// a half-resolution chroma grid of an odd-sized or odd-offset luma grid)
+static void make_taps(int in, double out, double out0, int outn, Taps& t) {
   const double scale = (double)in / out, support = std::max(scale, 1.0), inv = 1.0 / support;
   t.maxn = (int)std::ceil(support) * 2 + 1;
   t.x0.assign(outn, 0); t.n.assign(outn, 0); t.w.assign((size_t)outn * t.maxn, 0);
@@ -107,7 +110,9 @@ static void transpose(const uint8_t* src, int h, int w, uint8_t* dst) {
 // vertical pass over the needed rows, transpose, horizontal pass as a vertical pass, transpose.
 // Only the source window the crop needs is read. Chroma planes use the same call: their taps map
 // the smaller plane straight onto the output grid (centered siting falls out of the geometry).
-static void resize_plane(const uint8_t* src, int stride, int ph, int pw, const Request& r, uint8_t* dst) {
+struct Grid { double nh, nw, top, left; int oh, ow; };  // resized size, crop origin, crop size
+
+static void resize_plane(const uint8_t* src, int stride, int ph, int pw, const Grid& r, uint8_t* dst) {
   thread_local Taps tx, ty;
   thread_local std::vector<uint8_t> vert, cols, horiz;
   const int oh = r.oh, ow = r.ow;
@@ -199,16 +204,26 @@ static bool read_range(int fd, int64_t off, size_t n, std::vector<uint8_t>& buf,
 // write the wanted frame `f` into its output slot
 static void emit(const Request& r, const AVFrame* f, int slot) {
   ++g_frames;
-  if (r.mode == YUV) { copy_window(f, r, r.out + (size_t)slot * r.oh * r.ow * 3 / 2); return; }
   const size_t plane = (size_t)r.oh * r.ow;
+  const Grid g = {(double)r.nh, (double)r.nw, (double)r.top, (double)r.left, r.oh, r.ow};
+  if (r.mode == YUV) { copy_window(f, r, r.out + (size_t)slot * plane * 3 / 2); return; }
+  if (r.mode == YUV_RESIZED) {  // Y at (oh, ow), U / V at half: 4:2:0 at the output size
+    Timer t(RESIZE);
+    const Grid c = {g.nh / 2, g.nw / 2, g.top / 2, g.left / 2, r.oh / 2, r.ow / 2};
+    uint8_t* o = r.out + (size_t)slot * plane * 3 / 2;
+    resize_plane(f->data[0], f->linesize[0], f->height, f->width, g, o);
+    resize_plane(f->data[1], f->linesize[1], (f->height + 1) / 2, (f->width + 1) / 2, c, o + plane);
+    resize_plane(f->data[2], f->linesize[2], (f->height + 1) / 2, (f->width + 1) / 2, c, o + plane + plane / 4);
+    return;
+  }
   D.planes.resize(3 * plane);
   const bool sub = f->format != AV_PIX_FMT_YUV444P && f->format != AV_PIX_FMT_YUVJ444P;
   const int ch = sub ? (f->height + 1) / 2 : f->height, cw = sub ? (f->width + 1) / 2 : f->width;
   {
     Timer t(RESIZE);
-    resize_plane(f->data[0], f->linesize[0], f->height, f->width, r, D.planes.data());
-    resize_plane(f->data[1], f->linesize[1], ch, cw, r, D.planes.data() + plane);
-    resize_plane(f->data[2], f->linesize[2], ch, cw, r, D.planes.data() + 2 * plane);
+    resize_plane(f->data[0], f->linesize[0], f->height, f->width, g, D.planes.data());
+    resize_plane(f->data[1], f->linesize[1], ch, cw, g, D.planes.data() + plane);
+    resize_plane(f->data[2], f->linesize[2], ch, cw, g, D.planes.data() + 2 * plane);
   }
   Timer t(CONVERT);
   to_rgb(D.planes.data(), D.planes.data() + plane, D.planes.data() + 2 * plane, f, r, r.out + (size_t)slot * 3 * plane);

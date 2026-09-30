@@ -8,7 +8,7 @@ import os
 import numpy as np
 
 CODECS = {"h264": 0, "hevc": 1, "av1": 2}
-MODES = {"rgb": 0, "yuv": 1}
+MODES = {"rgb": 0, "yuv": 1, "yuv_resized": 2}
 STAGES = ("read", "decode", "convert", "resize")
 
 
