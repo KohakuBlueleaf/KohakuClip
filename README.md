@@ -69,15 +69,16 @@ native fps, AV1 CRF 36, GOP 16, filters off: 4.3 TB per 50M seconds at 768x512 (
 39.9 dB on the 256 crop). Cold reads on network storage, B300 host CPUs. ms per output frame per
 core (256 x 256 crop):
 
-| clip | 1 core | 24 cores (threads) |
-|---|---|---|
-| 8 frames @ 6 fps | 3.9 | 4.1 (725 clips/s) |
-| 8 frames @ 24 fps | 2.3 | 2.5 (1200 clips/s) |
-| 16 frames @ 6 fps | 3.6 | 3.9 (382 clips/s) |
-| 8 random frames (whole video) | 6.2 | 6.5 (460 clips/s) |
+| clip | rgb, 1 core | rgb, 24 cores | yuv, 1 core | yuv, 24 cores |
+|---|---|---|---|---|
+| 8 frames @ 6 fps | 3.7 | 4.2 (712 clips/s) | 3.2 | 3.5 (865 clips/s) |
+| 8 frames @ 24 fps | 2.2 | 2.5 (1197 clips/s) | 1.7 | 1.9 (1550 clips/s) |
+| 16 frames @ 6 fps | 3.6 | 3.9 (385 clips/s) | 2.8 | 3.2 (466 clips/s) |
+| 8 random frames (whole video) | 6.1 | 6.6 (455 clips/s) | 5.2 | 5.8 (519 clips/s) |
 
-Per frame at 8 @ 6 fps, one core: decode 3.3 ms, resize 0.35, convert 0.18, read <0.5.
-Clips from 60-300 s videos cost the same as from 3-30 s ones (one read per GOP).
+Per frame at 8 @ 6 fps, one core (rgb): decode 3.0 ms (2.9 frames decoded per output frame),
+resize 0.35, convert 0.2, read 0.2. Clips from 60-300 s videos cost the same as from 3-30 s ones
+(one read per GOP). 24 threads in one process scale like 24 processes.
 
 | setting | effect (ms per output frame, one core) |
 |---|---|
