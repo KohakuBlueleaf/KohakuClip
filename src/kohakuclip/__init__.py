@@ -1,19 +1,12 @@
-"""High-level Python API for KohakuClip."""
+"""KohakuClip: fast random-access video clips for training.
 
-from ._pipeline import (
-    FrameArray,
-    KClip,
-    PathLike,
-    VideoMetadata,
-    load_frames,
-    load_frames_from_bytes,
-)
+Storage: faststart mp4 (AV1 / H.264) in zip shards with an in-zip frame index (``writer``).
+Reading: plan in Python, read + decode + resize/crop natively in parallel (``Reader``).
+"""
 
-__all__ = [
-    "FrameArray",
-    "PathLike",
-    "KClip",
-    "VideoMetadata",
-    "load_frames",
-    "load_frames_from_bytes",
-]
+from .reader import Augment, Batch, Reader
+from .sampling import clip, random_frames
+from .shard import Shard, Video
+from ._native import profile
+
+__all__ = ["Augment", "Batch", "Reader", "Shard", "Video", "clip", "random_frames", "profile"]
