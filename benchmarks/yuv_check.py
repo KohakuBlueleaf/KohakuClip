@@ -40,16 +40,25 @@ def main():
     mse = ((out - ref) ** 2).mean().item()
     print(f"YUV (GPU convert + resize) vs RGB (CPU fused): PSNR {10 * np.log10(255 ** 2 / mse):.1f} dB, "
           f"mean |diff| {(out - ref).abs().mean().item():.2f}")
-    torch.cuda.synchronize()
-    t = time.perf_counter()
-    for _ in range(20):
-        yuv_to_rgb(batch, 256)
-    torch.cuda.synchronize()
-    ms = (time.perf_counter() - t) / 20 * 1000
-    print(f"yuv_to_rgb: {ms:.2f} ms per batch of {a.batch} x {a.frames} frames "
-          f"({ms / (a.batch * a.frames) * 1000:.1f} us/frame incl. H2D); bytes/frame "
-          f"yuv {batch.video.shape[-1]} vs rgb {3 * 256 * 256}")
+    # GPU cost per batch from pinned memory: copy + conversion (YUV) vs copy only (RGB)
+    yuv_host = torch.from_numpy(batch.video).pin_memory()
+    rgb_host = torch.from_numpy(rgb.read(items).video).pin_memory()
+    frames = a.batch * a.frames
 
+    def timed(fn, reps=20):
+        fn()
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) / reps * 1000
+
+    pinned = type(batch)(yuv_host.numpy(), batch.window, batch.flips, batch.colorspace)
+    ms_yuv = timed(lambda: yuv_to_rgb(pinned, 256))
+    ms_rgb = timed(lambda: (rgb_host.cuda(non_blocking=True).float() / 127.5 - 1))
+    print(f"GPU per frame: yuv copy + convert + resize {ms_yuv / frames * 1000:.1f} us, rgb copy + to float "
+          f"{ms_rgb / frames * 1000:.1f} us; bytes per frame yuv {batch.video.shape[-1]} vs rgb {3 * 256 * 256}")
 
 if __name__ == "__main__":
     main()
