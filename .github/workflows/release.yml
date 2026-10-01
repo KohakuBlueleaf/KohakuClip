@@ -106,22 +106,23 @@ jobs:
             echo "FFMPEG_LINK_MODE=dynamic"
             echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
             echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include -I/usr/include/x86_64-linux-gnu -I/usr/include"
-            echo "LD_LIBRARY_PATH=$CONDA_PREFIX/lib"
             echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed"
           } >> "$GITHUB_ENV"
       # conda-forge's FFmpeg dependencies (ICU, shaderc) need GLIBCXX 3.4.30: the wheels are
       # manylinux_2_35 (glibc 2.35, e.g. Ubuntu 22.04+), built on this Ubuntu 22.04 runner
-      # and repaired by maturin, which bundles FFmpeg and its libraries into the wheel.
+      # and repaired by maturin, which bundles FFmpeg and its libraries into the wheel
+      # (LD_LIBRARY_PATH only for that: the env's libpython must not reach other steps).
       - name: Build wheels
         run: |
           pip install "maturin[patchelf]"
-          maturin build --release --strip --compatibility manylinux_2_35 -i python3.13 -i python3.14 -o dist
+          LD_LIBRARY_PATH="$FFMPEG_LIBS_DIR" maturin build --release --strip \
+            --compatibility manylinux_2_35 -i python3.13 -i python3.14 -o dist
       - name: Smoke test the wheel in a clean venv
         run: |
           python3.13 -m venv .venv-wheel
           . .venv-wheel/bin/activate
-          env -u LD_LIBRARY_PATH pip install dist/*cp313*.whl
-          env -u LD_LIBRARY_PATH python scripts/ci/wheel_smoke.py
+          pip install dist/*cp313*.whl
+          python scripts/ci/wheel_smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: wheels
