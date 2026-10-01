@@ -102,7 +102,7 @@ jobs:
             echo "FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib"
             echo "FFMPEG_LINK_MODE=dynamic"
             echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
-            echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include -I/usr/include/x86_64-linux-gnu -I/usr/include"
             echo "LD_LIBRARY_PATH=$CONDA_PREFIX/lib"
             echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed"
           } >> "$GITHUB_ENV"
