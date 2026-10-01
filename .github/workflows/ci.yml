@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and the breakage-only ruff set (pyproject pins which rules block); rustfmt.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install black ruff
+      - run: black --check src/ tests/ benchmarks/ examples/ scripts/
+      - run: ruff check src/ tests/ benchmarks/ examples/ scripts/
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # Builds against conda-forge's FFmpeg (the GPL build: the tests encode H.264 with x264 too),
+  # then clippy, the Rust unit tests and the end-to-end suite on CPU torch.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: kohakuclip
+          create-args: >-
+            python=${{ matrix.python-version }}
+            ffmpeg=8.1.*=gpl*
+            libclang=18
+            clang=18
+          cache-environment: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build environment
+        run: |
+          {
+            echo "FFMPEG_INCLUDE_DIR=$CONDA_PREFIX/include"
+            echo "FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib"
+            echo "FFMPEG_LINK_MODE=dynamic"
+            echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include"
+            echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
+          } >> "$GITHUB_ENV"
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release --lib
+      - name: Install
+        run: |
+          pip install maturin
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install av numpy pytest
+          maturin develop --release
+      - run: pytest tests -v --tb=short
+
+  # The release build, end to end: a manylinux wheel with FFmpeg bundled, installed into a
+  # clean venv with no FFmpeg around, then imported and used to read a shard.
+  package-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          manylinux: 2_28
+          command: build
+          args: --release --strip -i python3.13 -o dist
+          before-script-linux: bash scripts/ci/ffmpeg_env.sh
+          docker-options: >-
+            -e FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include
+            -e FFMPEG_LIBS_DIR=/opt/ffmpeg/lib
+            -e FFMPEG_LINK_MODE=dynamic
+            -e LIBCLANG_PATH=/opt/ffmpeg/lib
+            -e BINDGEN_EXTRA_CLANG_ARGS=-I/opt/ffmpeg/lib/clang/18/include
+            -e LD_LIBRARY_PATH=/opt/ffmpeg/lib
+            -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the wheel into a clean venv
+        run: |
+          python -m venv .venv-wheel
+          . .venv-wheel/bin/activate
+          pip install dist/*.whl
+          python scripts/ci/wheel_smoke.py

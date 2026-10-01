@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  # Cutting a release in the GitHub UI, or pushing the tag, both publish.
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag, branch or sha to release"
+        required: false
+        default: ""
+      version:
+        description: "Stamp this version before building (nightlies pass X.Y.Z.devN)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  id-token: write
+
+# The only workflow that builds or uploads, so PyPI needs one trusted publisher:
+# this file (release.yml), environment `pypi`.
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            python scripts/ci/version.py write "${{ inputs.version }}"
+          fi
+          version=$(python scripts/ci/version.py read)
+          case "${version}" in
+            *dev*|*a*|*b*|*rc*) pre=true ;;
+            *) pre=false ;;
+          esac
+          {
+            echo "version=${version}"
+            echo "prerelease=${pre}"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing ${version} (prerelease=${pre})"
+
+      # A tag that disagrees with pyproject is a mis-cut release: stop before anything is
+      # uploaded, since a PyPI filename cannot be reused.
+      - name: Tag must match pyproject
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          test "${tag}" = "${{ steps.version.outputs.version }}" \
+            || { echo "tag ${tag} != pyproject ${{ steps.version.outputs.version }}"; exit 1; }
+
+  # manylinux wheels with an LGPL FFmpeg (libdav1d, SVT-AV1, aom, openh264) bundled by
+  # auditwheel: `pip install kohakuclip` needs nothing else. Source builds against your own
+  # FFmpeg go through the sdist (see README, Build).
+  wheels:
+    name: Wheels
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Stamp the version
+        if: inputs.version != ''
+        run: python scripts/ci/version.py write "${{ inputs.version }}"
+      - uses: PyO3/maturin-action@v1
+        with:
+          manylinux: 2_28
+          command: build
+          args: --release --strip -i python3.13 python3.14 -o dist
+          before-script-linux: bash scripts/ci/ffmpeg_env.sh
+          docker-options: >-
+            -e FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include
+            -e FFMPEG_LIBS_DIR=/opt/ffmpeg/lib
+            -e FFMPEG_LINK_MODE=dynamic
+            -e LIBCLANG_PATH=/opt/ffmpeg/lib
+            -e BINDGEN_EXTRA_CLANG_ARGS=-I/opt/ffmpeg/lib/clang/18/include
+            -e LD_LIBRARY_PATH=/opt/ffmpeg/lib
+            -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3
+      - name: Smoke test the wheel in a clean venv
+        run: |
+          python -m venv .venv-wheel
+          . .venv-wheel/bin/activate
+          pip install dist/*cp313*.whl
+          python scripts/ci/wheel_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  sdist:
+    name: Source distribution
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Stamp the version
+        if: inputs.version != ''
+        run: python scripts/ci/version.py write "${{ inputs.version }}"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -o dist
+      - run: pip install twine && twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish distributions to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kohakuclip
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-github:
+    name: Publish the GitHub release
+    needs: [version, publish-pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          tag="v${version}"
+          flag=""
+          if [ "${{ needs.version.outputs.prerelease }}" = "true" ]; then
+            flag="--prerelease"
+          fi
+          notes=$(python scripts/ci/release_notes.py --version "${version}")
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --title "KohakuClip ${version}" \
+              --notes "${notes}" ${flag} --target "$(git rev-parse HEAD)"
+          else
+            gh release edit "${tag}" --title "KohakuClip ${version}" \
+              --notes "${notes}" ${flag}
+          fi
+          for f in dist/*; do gh release upload "${tag}" "$f" --clobber; done
