@@ -30,5 +30,5 @@ cores (8 frames at 24 fps, 256 x 256).
 
 * Python 3.13+, type stubs for the native module; Rust checked with clippy, Python with ruff
   and mypy, both formatted (rustfmt, black).
-* CI, nightly builds and release automation under `.github/workflows/`; wheels bundle an
-  LGPL FFmpeg (libdav1d, SVT-AV1, aom, openh264).
+* CI, nightly builds and release automation under `.github/workflows/`; manylinux_2_35
+  wheels bundle an LGPL FFmpeg (libdav1d, SVT-AV1, aom, openh264).

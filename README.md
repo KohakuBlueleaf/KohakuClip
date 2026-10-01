@@ -179,9 +179,9 @@ read per GOP): 3.24 ms at 8 @ 6 fps, 6.56 for 8 random frames (more GOPs per cli
 pip install kohakuclip
 ```
 
-The wheels (manylinux 2.28, x86-64-v3, Python 3.13 / 3.14) bundle an LGPL FFmpeg 8.1 from
-conda-forge with libdav1d (AV1 decoding), SVT-AV1 and aom (AV1 encoding) and openh264; they
-need nothing else installed. That build has no x264 / x265, so `--codec h264` / `hevc`
+The wheels (manylinux_2_35: glibc 2.35+, e.g. Ubuntu 22.04 or newer; x86-64-v3; Python 3.13
+/ 3.14) bundle an LGPL FFmpeg 8.1 from conda-forge with libdav1d (AV1 decoding), SVT-AV1 and
+aom (AV1 encoding) and openh264; they need nothing else installed. That build has no x264 / x265, so `--codec h264` / `hevc`
 needs a source build against an FFmpeg that has them, or `--backend ffmpeg`.
 
 To build against your own FFmpeg (libavcodec, libavformat, libswscale, libavutil; with

@@ -72,32 +72,45 @@ jobs:
           maturin develop --release
       - run: pytest tests -v --tb=short
 
-  # The release build, end to end: a manylinux wheel with FFmpeg bundled, installed into a
-  # clean venv with no FFmpeg around, then imported and used to read a shard.
+  # The release build, end to end: a manylinux_2_35 wheel with FFmpeg bundled, installed
+  # into a clean venv with no FFmpeg around, then used to encode, pack and read a shard.
   package-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          manylinux: 2_28
-          command: build
-          args: --release --strip -i python3.13 -o dist
-          before-script-linux: bash scripts/ci/ffmpeg_env.sh
-          docker-options: >-
-            -e FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include
-            -e FFMPEG_LIBS_DIR=/opt/ffmpeg/lib
-            -e FFMPEG_LINK_MODE=dynamic
-            -e LIBCLANG_PATH=/opt/ffmpeg/lib
-            -e BINDGEN_EXTRA_CLANG_ARGS=-I/opt/ffmpeg/lib/clang/18/include
-            -e LD_LIBRARY_PATH=/opt/ffmpeg/lib
-            -e RUSTFLAGS=-Ctarget-cpu=x86-64-v3
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: ffmpeg
+          create-args: >-
+            ffmpeg=8.1.*=lgpl*
+            libclang=18
+            clang=18
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build environment (the LGPL FFmpeg, clang 18 for the bindings)
+        shell: bash -el {0}
+        run: |
+          {
+            echo "FFMPEG_INCLUDE_DIR=$CONDA_PREFIX/include"
+            echo "FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib"
+            echo "FFMPEG_LINK_MODE=dynamic"
+            echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include"
+            echo "LD_LIBRARY_PATH=$CONDA_PREFIX/lib"
+            echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed"
+          } >> "$GITHUB_ENV"
+      # conda-forge's FFmpeg dependencies (ICU, shaderc) need GLIBCXX 3.4.30: the wheels are
+      # manylinux_2_35 (glibc 2.35, e.g. Ubuntu 22.04+), built on this Ubuntu 22.04 runner
+      # and repaired by maturin, which bundles FFmpeg and its libraries into the wheel.
+      - name: Build wheels
+        run: |
+          pip install "maturin[patchelf]"
+          maturin build --release --strip --compatibility manylinux_2_35 -i python3.13 -o dist
       - name: Install the wheel into a clean venv
         run: |
           python -m venv .venv-wheel
           . .venv-wheel/bin/activate
-          pip install dist/*.whl
-          python scripts/ci/wheel_smoke.py
+          env -u LD_LIBRARY_PATH pip install dist/*.whl
+          env -u LD_LIBRARY_PATH python scripts/ci/wheel_smoke.py
