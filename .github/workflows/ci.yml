@@ -101,16 +101,17 @@ jobs:
             echo "FFMPEG_LINK_MODE=dynamic"
             echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
             echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include -I/usr/include/x86_64-linux-gnu -I/usr/include"
-            echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed"
+            echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed -Clink-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
           } >> "$GITHUB_ENV"
       # conda-forge's FFmpeg dependencies (ICU, shaderc) need GLIBCXX 3.4.30: the wheels are
       # manylinux_2_35 (glibc 2.35, e.g. Ubuntu 22.04+), built on this Ubuntu 22.04 runner
       # and repaired by maturin, which bundles FFmpeg and its libraries into the wheel
-      # (LD_LIBRARY_PATH only for that: the env's libpython must not reach other steps).
+      # (found through the extension's rpath; LD_LIBRARY_PATH would hand the env's
+      # libpython to every Python on the runner).
       - name: Build wheels
         run: |
           pip install "maturin[patchelf]"
-          LD_LIBRARY_PATH="$FFMPEG_LIBS_DIR" maturin build --release --strip \
+          maturin build --release --strip \
             --compatibility manylinux_2_35 -i python3.13 -o dist
       - name: Install the wheel into a clean venv
         run: |
