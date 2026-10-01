@@ -84,7 +84,10 @@ jobs:
       - uses: mamba-org/setup-micromamba@v2
         with:
           environment-name: ffmpeg
+          # the same packages as the test job's environment (whose bindings build), with the
+          # LGPL FFmpeg
           create-args: >-
+            python=3.13
             ffmpeg=8.1.*=lgpl*
             libclang=18
             clang=18
