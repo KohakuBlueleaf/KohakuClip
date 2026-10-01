@@ -97,6 +97,8 @@ jobs:
             libclang=18
             clang=18
       - uses: dtolnay/rust-toolchain@stable
+      # Steps after this one run outside the activated environment: CLANG_PATH keeps the
+      # bindings on the environment's clang (the runner's own clang has other headers).
       - name: Build environment (the LGPL FFmpeg, clang 18 for the bindings)
         shell: bash -el {0}
         run: |
@@ -105,6 +107,7 @@ jobs:
             echo "FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib"
             echo "FFMPEG_LINK_MODE=dynamic"
             echo "LIBCLANG_PATH=$CONDA_PREFIX/lib"
+            echo "CLANG_PATH=$CONDA_PREFIX/bin/clang"
             echo "BINDGEN_EXTRA_CLANG_ARGS=-I$CONDA_PREFIX/lib/clang/18/include -I/usr/include/x86_64-linux-gnu -I/usr/include"
             echo "RUSTFLAGS=-Ctarget-cpu=x86-64-v3 -Clink-arg=-Wl,--as-needed -Clink-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
           } >> "$GITHUB_ENV"
