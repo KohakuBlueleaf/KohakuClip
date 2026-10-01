@@ -1,88 +1,147 @@
 # KohakuClip
 
-Fast random-access video clips for training. Videos are stored as faststart mp4 (AV1 or H.264)
-in zip or tar shards with an in-archive frame index (or as plain mp4 folders); a batch of clips is
-read, decoded, resized and cropped natively on a persistent thread pool, straight into a (pinned)
-uint8 buffer.
+Fast random-access video clips for training. Videos are stored as mp4 files (AV1, H.264 or HEVC)
+in zip or tar shards with an in-archive frame index, or read straight from folders and archives of
+mp4 files. Each batch of clips is planned and decoded natively (Rust, on the system's FFmpeg
+libraries) on a persistent thread pool, straight into a (pinned) uint8 buffer, without the GIL.
 
 ```python
-from kohakuclip import Reader, Augment, clip, random_frames
+from kohakuclip import Reader
 
 reader = Reader(
     ["data/shard_00000.zip", "data/more.tar", "data/mp4_folder"],
     size=256,
     threads=16,
-    augment=Augment(crop="random", hflip=0.5),
+    hflip=0.5,
 )
-# n frames, fps, stored h / w, codec of one video
-v = reader.info(vid)
-# 8 frames at 6 fps from a random start, or random_frames(v.n, 8, rng)
-frames = clip(v.n, v.fps, frames=8, target_fps=6, rng=rng)
-# uint8 [B, T, 3, 256, 256]
-video = reader.read([(vid, frames), ...]).video
+# 16 clips of 8 frames at 6 fps from random videos and random starts
+items = reader.sample(16, frames=8, fps=6.0)
+# uint8 [16, 8, 3, 256, 256]
+video = reader.read(items).video
 ```
 
-With PyTorch, `kohakuclip.torch.Loader` keeps batches queued on the native pool from one
-background thread (the native calls release the GIL) and returns pinned tensors:
+`items` is a list of (video id, frame indices); any sampler works (`reader.info(vid)` gives the
+frame count, fps, size and codec, `kohakuclip.clip` / `random_frames` are the stock samplers).
+
+## In a PyTorch training loop
+
+`kohakuclip.torch.ClipDataset` is an `IterableDataset` whose items are whole batches; iterate it
+directly (decoding in this process, into pinned memory) or through a `DataLoader`.
+`ClipLoader` runs either way and keeps the resume state:
 
 ```python
-from kohakuclip.torch import Loader
+from kohakuclip.torch import ClipDataset, ClipLoader
 
-
-def sample(rng):
-    vid = rng.randrange(len(reader))
-    v = reader.info(vid)
-    return vid, clip(v.n, v.fps, 8, 6.0, rng)
-
-
-# uint8 [16, 8, 3, 256, 256], pinned
-for video in Loader(reader, sample, batch_size=16):
+dataset = ClipDataset(
+    shards, batch_size=16, frames=8, fps=6.0, threads=8, hflip=0.5, seed=0
+)
+loader = ClipLoader(dataset, workers=0)  # or workers=2: DataLoader worker processes
+for video in loader:  # uint8 [16, 8, 3, 256, 256]
     video = video.cuda(non_blocking=True).float() / 127.5 - 1
+    ...
+checkpoint["loader"] = loader.state_dict()  # resume: loader.load_state_dict(...)
 ```
+
+- Batch `i` of a rank is a pure function of (`seed`, rank, `i`): the same batches whatever the
+  number of DataLoader workers, and a resumed run continues with exactly the batches the
+  original would have seen next (state: the seed and a batch count).
+- Ranks come from `torch.distributed` (or `RANK` / `WORLD_SIZE`); each rank draws its own
+  batches, no sampler needed.
+- `epochs=True` visits every video once per epoch in a seeded order, split over ranks;
+  the default draws videos at random.
+- Lightning: pass `ClipLoader(dataset, lookahead=1)` as the train loader. Lightning stores its
+  state in every checkpoint and restores it on `ckpt_path=...`; `lookahead=1` because its
+  training loop fetches one batch ahead of the one it trains on.
+
+Examples: `examples/torch_loop.py` (a plain loop with checkpoint and resume) and
+`examples/lightning_module.py` (Lightning, DDP, resume).
+
+Loader alone (`benchmarks/loader_bench.py`: no model, 16 clips of 8 frames at 6 fps per batch,
+copied to a B300; Xeon 6747P):
+
+| setup | clips/s | training thread CPU per batch |
+|---|---|---|
+| in process, 8 threads | 320 | 0.11 ms |
+| in process, 16 threads | 650 | 0.13 ms |
+| in process, 24 threads | 886 | 0.32 ms |
+| 1 DataLoader worker x 16 threads | 633 | 0.12 ms |
+| 2 workers x 8 threads | 642 | 0.11 ms |
+| 2 workers x 12 threads | 932 | 0.26 ms |
+| 4 workers x 4 threads | 644 | 0.14 ms |
+
+Throughput follows the total number of decode threads, however they are split; the training
+thread spends a fraction of a millisecond per batch either way (with workers, the DataLoader's
+pin-memory thread also copies each batch once more in the main process). Pinned copies run at
+~52 GB/s against ~13 GB/s from pageable memory, and torch's caching host allocator hands out a
+pinned buffer in ~3 us, so decoding each batch into a fresh pinned tensor is the cheap path.
+
+In Foliation's pretraining (TT3D-B/16 + DiT-S, 2 x B300, 16 clips per GPU) every setup trains at
+the same speed within the run-to-run spread (about +-0.1 it/s over 3 interleaved rounds of 500
+steps): tar of JPEG with 16 DataLoader workers 7.10 it/s, KohakuClip in process (8 threads)
+7.13, 2 workers x 8 threads 6.99, 4 workers x 4 threads 7.07. A profile of that loop shows the
+GPU busy for the whole step, so the loader is not on the critical path at 115 clips/s per GPU.
+
+Memory (`benchmarks/leak_check.py`, anonymous resident memory): flat over 1500 yuv batches and
+100 encode + pack rounds; rgb reading grows during warm-up (per-thread buffers and decoders)
+and by under 1 KB per batch afterwards; creating and dropping 200 readers leaves ~17 KB each.
 
 ## Writing shards
 
 ```bash
-kohakuclip-write out_dir videos/*.mp4 --codec av1 --crf 36 --per-shard 1000
+kohakuclip-write out_dir videos/ more_videos.tar clip.mp4 --codec av1 --crf 36 --per-shard 1000
 ```
+
+Sources are video files, folders (every video file below them) and tar archives of videos (read
+into memory, nothing is extracted). Each video is re-encoded by the FFmpeg libraries KohakuClip is
+linked against: demux and decode anything FFmpeg reads, scale, encode, mux into memory, all
+without the GIL, one video per thread (`--workers`). `--backend ffmpeg` runs the same encode on
+the `ffmpeg` command line instead (for encoders the linked FFmpeg lacks). Packing and the index
+are native in both cases. From Python: `kohakuclip.writer.write(...)`, or `kohakuclip._core.encode`
+(a path or the bytes of a video in, mp4 bytes out) and `kohakuclip._core.pack`.
 
 Defaults (measured below): native fps, short side capped at 512 (never upscaled), closed GOP of
 16, AV1 via SVT-AV1 preset 6 with the in-loop filters (deblocking, CDEF, loop restoration) off,
-faststart mp4, zip (stored) or tar. Needs an `ffmpeg` with libsvtav1 (or libx264 for
-`--codec h264`) and PyAV. The writer also parses the AV1 frame headers and records, per sample,
-how many bytes later frames depend on: SVT-AV1 puts half of all frames in a top layer nothing
-references, so unwanted samples are decoded only up to their last referenced frame (25 % of
-samples are dropped entirely, 25 % truncated), bit-exactly.
+faststart mp4, zip (stored) or tar. `--codec h264` / `hevc` use libx264 / libx265 if the FFmpeg
+build has them. Untagged sources are tagged as BT.601 (SD) or BT.709 (HD), the usual guess.
 
-Sources: a `Reader` takes any mix of zip archives (stored), uncompressed tar archives and folder
-trees (every `*.mp4` below them, recursively). Archives written by `kohakuclip-write`
-(`--container zip|tar`) carry an index member; archives without one, and folders, fall back to
-parsing each mp4's `moov` box on first use (all return the same clips; see `tests`).
+The writer also parses the AV1 frame headers and records, per sample, how many bytes later frames
+depend on: SVT-AV1 puts half of all frames in a top layer nothing references, so unwanted samples
+are decoded only up to their last referenced frame (25 % of samples are dropped entirely, 25 %
+truncated), bit-exactly.
 
-Shard layout: `shard_XXXXX.zip` (or `.tar`) = the mp4 files + `__index__.bin` (per frame:
-absolute byte offset, size, bytes later frames depend on, keyframe flag; per video: fps, size,
-codec, decoder prefix). The index is memory-mapped from the archive (shared by all workers through
-the page cache).
+## Sources
+
+A `Reader` takes any mix of zip archives (stored members), tar archives and folder trees (every
+`*.mp4` below them). Archives written by `kohakuclip-write` carry an index member
+(`__index__.bin`): per frame the absolute byte offset, size, the bytes later frames depend on and
+a keyframe flag; per video fps, size, codec, colorspace and the decoder's codec configuration. It
+is memory-mapped from the archive (shared by all workers through the page cache). Archives without
+one, and folders, fall back to parsing each mp4's `moov` box on first use (any box order) and
+caching the result; they return the same clips (see `tests`).
 
 ## How a clip is read
 
-1. Python plans each clip from the index: wanted frames -> one byte range per GOP (keyframe to
-   last wanted frame), unwanted samples cut to the bytes later frames need, crop and flips.
-2. One native call per batch (`Reader.submit` / `Pending.result`): per GOP one `pread`, decode
-   with a persistent per-thread decoder (libdav1d for AV1, libavcodec for H.264 / HEVC), then per
-   wanted frame: antialiased bilinear resize of each YUV plane fused with the crop (only the source
+1. Planning (native, no GIL): per GOP holding wanted frames, one byte range from its keyframe to
+   its last wanted frame; unwanted samples cut to the bytes later frames need; the crop and flips.
+2. Decoding, per clip on the pool: one `pread` per GOP, a persistent single-threaded decoder per
+   thread (libdav1d for AV1, libavcodec for H.264 / HEVC) and one reused frame, then per wanted
+   frame an antialiased bilinear resize of each YUV plane fused with the crop (only the source
    window the crop needs is read), conversion of the output pixels to RGB, flips.
-3. Batches queued back to back share one FIFO on the pool: no per-batch barrier, and planning
-   overlaps decoding.
+3. Batches queued back to back share one FIFO on the pool: no per-batch barrier.
 
 Output modes (storage and disk reads are the same in all three; `kohakuclip.torch.yuv_to_rgb`
-finishes the yuv modes on the GPU):
+finishes the yuv modes on the GPU with one Triton kernel):
 
-| `mode` | CPU per frame | host-to-GPU bytes / frame | GPU per frame | vs `rgb` |
+| `mode` | CPU, ms per frame | host-to-GPU bytes per frame | GPU per frame (copy + kernel) | vs `rgb` |
 |---|---|---|---|---|
-| `"rgb"` (default) | resize + convert | 196,608 (256 x 256 x 3) | 4.5 us (copy) | - |
-| `"yuv_resized"`: planes resized to the crop, 4:2:0 | resize | 98,304 (0.5x) | 9.2 us | 43.2 dB (chroma at half the output resolution) |
-| `"yuv"`: stored-resolution window, 4:2:0 | none | 393,216 at 512p storage (2x) | 27.9 us | 48.7 dB |
+| `"rgb"` (default): resize + convert on the CPU | 3.23 | 196,608 (256 x 256 x 3) | 3.8 us + none | - |
+| `"yuv_resized"`: planes resized to the crop, 4:2:0 | 3.09 | 98,304 (0.5x) | 1.9 us + 0.8 us | 43.5 dB (chroma at half the output resolution) |
+| `"yuv"`: stored-resolution window, 4:2:0 | 3.12 | 393,216 at 512p storage (2x) | 7.3 us + 7.0 us | 49.2 dB |
+
+CPU: 8 frames at 6 fps, one core. GPU: B300, pinned copies, 16 x 8 frames per batch. The Triton
+kernel (chroma upsampling, conversion, antialiased resize, flips, scaling in one pass) agrees
+with the plain torch version to within float rounding and is 3-9x faster (torch 7.7 / 22.2 us per
+frame; `torch.compile` does not help).
 
 ## Measurements
 
@@ -90,54 +149,81 @@ VidGen-1M sample (981 videos, 720p H.264 sources, mean 10.5 s, ~28 fps) stored a
 native fps, AV1 CRF 36, GOP 16, filters off: 4.3 TB per 50M seconds at 768x512 (38.5 dB stored,
 39.9 dB on the 256 crop). Cold reads on network storage; Intel Xeon 6747P (2 x 48 cores, 2
 threads per core, max 2.7 GHz), 48 hardware threads per job. ms per output frame per core
-(256 x 256 crop):
+(256 x 256 rgb crop):
 
-| clip | rgb, 1 core | rgb, 24 cores | yuv, 1 core | yuv, 24 cores |
-|---|---|---|---|---|
-| 8 frames @ 6 fps | 3.7 | 4.2 (712 clips/s) | 3.2 | 3.5 (865 clips/s) |
-| 8 frames @ 24 fps | 2.2 | 2.5 (1197 clips/s) | 1.7 | 1.9 (1550 clips/s) |
-| 16 frames @ 6 fps | 3.6 | 3.9 (385 clips/s) | 2.8 | 3.2 (466 clips/s) |
-| 8 random frames (whole video) | 6.1 | 6.6 (455 clips/s) | 5.2 | 5.8 (519 clips/s) |
+| clip | 1 core | 24 cores |
+|---|---|---|
+| 8 frames @ 6 fps | 3.23 | 3.50 (857 clips/s) |
+| 8 frames @ 24 fps | 1.84 | 1.99 (1506 clips/s) |
+| 16 frames @ 6 fps | 2.83 | 3.04 (494 clips/s) |
+| 8 random frames (whole video) | 5.21 | 5.73 (524 clips/s) |
 
-Per frame at 8 @ 6 fps, one core (rgb): decode 3.0 ms (2.9 frames decoded per output frame),
-resize 0.35, convert 0.2, read 0.2. Clips from 60-300 s videos cost the same as from 3-30 s ones
-(one read per GOP). 24 threads in one process scale like 24 processes; past 24 threads the job's
-hardware threads share cores, so per-core time rises.
+Per frame at 8 @ 6 fps, one core: decode 2.66 ms (2.9 frames decoded per output frame), resize
+0.19, read 0.31, convert 0.06. Clips from 60-300 s videos cost the same as from 3-30 s ones (one
+read per GOP): 3.24 ms at 8 @ 6 fps, 6.56 for 8 random frames (more GOPs per clip).
 
 | setting | effect (ms per output frame, one core) |
 |---|---|
 | AV1 in-loop filters off (writer) | -20 to -27 % decode, same size, same crop quality |
-| decode only what later frames need of unwanted samples (`skip=True`) | 8f@6 4.29 -> 3.27, 8 random 6.62 -> 5.12 (whole-unit skipping alone: 3.65 / 5.72); bit-exact |
-| resize YUV planes, then convert (vs convert, then resize) | 4.97 -> 4.22; the two agree at 48.4 dB (differ only at saturated edges) |
-| `mode="yuv"` / `"yuv_resized"` vs `"rgb"` (one job, another node) | 8f@6 3.52 -> 2.72 / 3.01, 8f@24 1.88 -> 1.41 / 1.65, 8 random 5.35 -> 4.44 / 4.82 |
-| threads, 2 batches in flight vs synchronous | 16 cores 5.04 -> 4.72, 24 cores 5.99 -> 4.53 (= separate processes) |
+| decode only what later frames need of unwanted samples (`skip=True`) | 8 @ 6 fps 3.96 -> 3.23, 8 random 6.73 -> 5.21; bit-exact |
+| resize YUV planes, then convert (vs convert, then resize) | 4.97 -> 4.22; the two agree at 48.4 dB |
+| SIMD resize (AVX-512 VNNI vs the auto-vectorized code) | resize 0.29 -> 0.20 |
+| conversion written to auto-vectorize (no per-pixel branches) | convert 0.20 -> 0.06 |
+| 2 batches in flight vs synchronous (threads) | 24 cores 5.99 -> 4.53 (= separate processes) |
 | index vs moov fallback | within ~3 % |
+| this core vs the previous C++ one (same plan, both `-march=native`) | 8 @ 6 fps 3.85 -> 3.23, 8 @ 24 fps 2.25 -> 1.84 |
 
-## In a training loop
-
-Measured in Foliation's pretraining (TT3D-B/16, 2 x B300, 16 clips per GPU, 8 frames @ 6 fps):
-
-| loader | it/s |
-|---|---|
-| tar of JPEG, 16 DataLoader workers per GPU | 7.20 |
-| KohakuClip in the training process, 8 threads | 7.02 |
-| KohakuClip in 1 DataLoader worker, 16 threads | 7.09 |
-| KohakuClip in 2 DataLoader workers, 8 threads each | 7.17 |
-
-Planning a batch holds the GIL for a few ms; in the training process that competes with a
-host-bound training step. Run the reader in one or two DataLoader workers (each a background
-`Loader`, handing one batch per step through shared memory) and pin in the main process.
-
-## Build
+## Install and build
 
 ```bash
-pip install -e .                          # FFmpeg found with pkg-config
-KOHAKUCLIP_FFMPEG=/opt/ffmpeg pip install -e .   # or a prefix with include/ and lib/
+pip install kohakuclip
 ```
 
-Python >= 3.13, Linux. The core (`src/kohakuclip/native/kc.cpp`, C++17, FFmpeg's libavcodec
-with libdav1d) is loaded with ctypes; `KOHAKUCLIP_MARCH` sets `-march` (default `native`).
+The wheels (manylinux 2.28, x86-64-v3, Python 3.13 / 3.14) bundle an LGPL FFmpeg 8.1 from
+conda-forge with libdav1d (AV1 decoding), SVT-AV1 and aom (AV1 encoding) and openh264; they
+need nothing else installed. That build has no x264 / x265, so `--codec h264` / `hevc`
+needs a source build against an FFmpeg that has them, or `--backend ffmpeg`.
 
-Tests (`pytest tests`) write AV1 and H.264 shards from synthetic videos and compare the reader
-with a PyAV + torch reference, zip / tar / folder sources (index and moov fallback) with each
-other, and skipping with full decoding. Code is formatted with black.
+To build against your own FFmpeg (libavcodec, libavformat, libswscale, libavutil; with
+libdav1d for AV1 decoding and libsvtav1 for AV1 encoding), e.g. conda-forge / micromamba
+(`micromamba install ffmpeg "libclang=18" "clang=18"`) or the distro's. The Rust bindings
+are generated at build time by bindgen, with libclang 18 (newer versions generate broken FFmpeg
+bindings with this bindgen) and clang's own headers:
+
+```bash
+export FFMPEG_INCLUDE_DIR=$CONDA_PREFIX/include FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib
+export FFMPEG_LINK_MODE=dynamic LIBCLANG_PATH=$CONDA_PREFIX/lib
+export BINDGEN_EXTRA_CLANG_ARGS="-I$CONDA_PREFIX/lib/clang/18/include"
+export RUSTFLAGS="-C target-cpu=native -C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
+pip install .  # or: maturin develop --release
+```
+
+Linux, x86-64 (other targets build without the SIMD kernels). The resize picks SSE2 / AVX2 /
+AVX-512 VNNI kernels at runtime (`KOHAKUCLIP_SIMD=plain|avx2` caps it).
+
+Releases: `.github/workflows/release.yml` is the only workflow that builds or publishes
+(wheels, sdist, PyPI through trusted publishing, GitHub release with notes from `Change.md`);
+`nightly.yml` dispatches it daily when `main` moved, `auto-patch-release.yml` cuts a patch
+weekly. The version lives in `pyproject.toml` (`scripts/ci/version.py`).
+
+## Code
+
+- `src/kclip_rs/` (Rust): `storage/` (zip / tar / folder listing and writing, the index, shards),
+  `mp4/` (moov parsing, decoder configuration, faststart), `read/` (planning, sampling, the thread
+  pool), `decode/` (decoding a planned clip), `image/` (resize, conversion, SIMD kernels),
+  `write/` (encoding with FFmpeg, AV1 dependency parsing, packing), `python/` (the
+  `kohakuclip._core` module).
+- `src/kohakuclip/` (Python): the package, `torch.py` (`ClipDataset`, `ClipLoader`,
+  `yuv_to_rgb`), `gpu.py` (the Triton kernel), `writer.py` (sources, the ffmpeg command-line
+  backend, the CLI).
+- `examples/`: a plain PyTorch loop and a Lightning module. `benchmarks/`: reader speed
+  (`bench.py`), the PyTorch side (`loader_bench.py`), the GPU side (`gpu_check.py`), memory
+  (`leak_check.py`).
+
+Tests (`pytest tests`) write AV1 and H.264 shards from synthetic videos (native and command-line
+encoders) and compare the reader with a PyAV + torch reference; zip / tar / folder sources with
+the index and the moov fallback with each other; skipping with full decoding; tar and in-memory
+inputs with files; the yuv modes with rgb; `ClipDataset` batches across worker counts and after
+resuming. `cargo test` checks the SIMD kernels against the plain
+code. Rust is formatted with rustfmt and checked with clippy; Python is formatted with black and
+checked with ruff and mypy.

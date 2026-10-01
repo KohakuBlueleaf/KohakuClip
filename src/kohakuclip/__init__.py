@@ -1,21 +1,20 @@
 """KohakuClip: fast random-access video clips for training.
 
-Storage: faststart mp4 (AV1 / H.264) in zip shards with an in-zip frame index (``writer``).
-Reading: plan in Python, read + decode + resize/crop natively in parallel (``Reader``).
+Storage: mp4 files (AV1 / H.264 / HEVC) in zip or tar shards with an in-archive frame index
+(``kohakuclip.writer``), or plain folders of mp4 files.
+Reading: ``Reader`` plans each batch and decodes it natively on a persistent thread pool (pread
+per GOP, libavcodec / libdav1d, antialiased resize fused with the crop), without the GIL.
 """
 
-from .reader import Augment, Batch, Reader
+from ._core import Batch, Pending, Reader, VideoInfo, profile
 from .sampling import clip, random_frames
-from .shard import Shard, Video
-from ._native import profile
 
 __all__ = [
-    "Augment",
     "Batch",
+    "Pending",
     "Reader",
-    "Shard",
-    "Video",
+    "VideoInfo",
     "clip",
-    "random_frames",
     "profile",
+    "random_frames",
 ]

@@ -1,0 +1,38 @@
+[package]
+name = "kohakuclip"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Fast random-access video clips for training"
+
+[lib]
+name = "kohakuclip"
+path = "src/kclip_rs/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crc32fast = "1.5"
+bytemuck = { version = "1.25", features = ["derive"] }
+crossbeam-channel = "0.5"
+lru = "0.18"
+memmap2 = "0.9"
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+rand = "0.10"
+rsmpeg = { version = "0.18", default-features = false, features = ["ffmpeg8"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+walkdir = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

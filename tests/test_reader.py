@@ -1,133 +1,164 @@
-"""End-to-end: write shards from synthetic videos, read clips back, compare with a PyAV + torch reference.
+"""End-to-end: write shards from synthetic videos, read clips back, compare with a PyAV + torch
+reference.
 
-Needs an ffmpeg with libsvtav1 and libx264 ($KOHAKUCLIP_TEST_FFMPEG, default "ffmpeg") and PyAV.
+Needs an FFmpeg with libsvtav1 and libx264 (the linked libraries, and the ``ffmpeg`` command for
+the command-line backend: $KOHAKUCLIP_TEST_FFMPEG, default "ffmpeg") and PyAV.
 """
 
+import io
 import os
 import random
 import subprocess
+import tarfile
+import zipfile
 
 import numpy as np
 import pytest
 
 av = pytest.importorskip("av")
 torch = pytest.importorskip("torch")
-import torch.nn.functional as F  # noqa: E402
+import torch.nn.functional as F
 
-from kohakuclip import Augment, Reader, Shard, clip, random_frames  # noqa: E402
-from kohakuclip.writer import Encoding, write  # noqa: E402
+from kohakuclip import Reader, _core, clip, random_frames
+from kohakuclip.writer import Encoding, write
 
 FFMPEG = os.environ.get("KOHAKUCLIP_TEST_FFMPEG", "ffmpeg")
 SIZE = 128
+SOURCES = [(640, 360, 3), (360, 640, 2), (1280, 720, 4)]  # width, height, seconds
 
 
-@pytest.fixture(scope="module", params=["av1", "h264"])
-def shards(request, tmp_path_factory):
-    tmp = tmp_path_factory.mktemp(request.param)
-    sources = []
-    for i, (w, h, sec) in enumerate([(640, 360, 3), (360, 640, 2), (1280, 720, 4)]):
+def synthetic(path: str, w: int, h: int, seconds: int) -> None:
+    cmd = [
+        FFMPEG,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={w}x{h}:rate=30:duration={seconds}",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "12",
+        path,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+@pytest.fixture(scope="module")
+def sources(tmp_path_factory) -> list[str]:
+    tmp = tmp_path_factory.mktemp("sources")
+    paths = []
+    for i, (w, h, seconds) in enumerate(SOURCES):
         path = str(tmp / f"src{i}.mp4")
-        subprocess.run(
-            [
-                FFMPEG,
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                f"testsrc2=size={w}x{h}:rate=30:duration={sec}",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libx264",
-                "-crf",
-                "12",
-                path,
-            ],
-            check=True,
-        )
-        sources.append(path)
-    enc = Encoding(
-        codec=request.param, crf=30 if request.param == "av1" else 20, ffmpeg=FFMPEG
+        synthetic(path, w, h, seconds)
+        paths.append(path)
+    return paths
+
+
+@pytest.fixture(scope="module", params=["av1", "h264", "av1-ffmpeg"])
+def shards(request, sources, tmp_path_factory) -> list[str]:
+    codec, _, backend = request.param.partition("-")
+    tmp = tmp_path_factory.mktemp(request.param)
+    enc = Encoding(codec=codec, crf=30 if codec == "av1" else 20)
+    return write(
+        sources,
+        str(tmp / "out"),
+        enc,
+        per_shard=2,
+        workers=3,
+        backend=backend or "native",
+        ffmpeg=FFMPEG,
     )
-    return write(sources, str(tmp / "out"), enc, per_shard=2, workers=3)
 
 
-def reference(
-    shard: Shard, i: int, frames: list[int], top: int, left: int
-) -> np.ndarray:
-    """PyAV decode (YUV planes) -> torch antialiased resize of each plane onto the output grid (short
-    side -> SIZE) -> crop -> BT.709 limited-range conversion: the core's order, in float.
-    """
-    import zipfile
+def member_bytes(source: str, name: str) -> bytes:
+    if tarfile.is_tarfile(source):
+        with tarfile.open(source) as t:
+            return t.extractfile(name).read()
+    with zipfile.ZipFile(source) as z:
+        return z.read(name)
 
-    name = shard.members[i].name
-    with zipfile.ZipFile(shard.path) as z, z.open(name) as f, av.open(f) as c:
-        yuv = [fr.to_ndarray(format="yuv420p") for fr in c.decode(video=0)]
+
+# (R from V, G from U, G from V, B from U), limited range
+MATRIX = {
+    "bt709": (1.5748, -0.187324, -0.468124, 1.8556),
+    "bt601": (1.402, -0.344136, -0.714136, 1.772),
+}
+
+
+def reference(reader: Reader, vid: int, frames: list[int]) -> np.ndarray:
+    """PyAV decode (YUV planes) -> torch antialiased resize of each plane onto the output grid
+    (short side -> SIZE) -> center crop -> limited-range conversion with the stored colorspace:
+    the core's order, in float."""
+    v = reader.info(vid)
+    data = member_bytes(str(v.source), v.name)
+    with av.open(io.BytesIO(data)) as c:
+        yuv = [f.to_ndarray(format="yuv420p") for f in c.decode(video=0)]
     x = torch.from_numpy(np.stack([yuv[k] for k in frames])).float()
+
     h, w = x.shape[1] * 2 // 3, x.shape[2]
-    sc = SIZE / min(h, w)
-    size = (max(SIZE, round(h * sc)), max(SIZE, round(w * sc)))
+    scale = SIZE / min(h, w)
+    size = (max(SIZE, round(h * scale)), max(SIZE, round(w * scale)))
+    top, left = (size[0] - SIZE) // 2, (size[1] - SIZE) // 2
     planes = [
         x[:, None, :h],
         x[:, h : h + h // 4].reshape(-1, 1, h // 2, w // 2),
         x[:, h + h // 4 :].reshape(-1, 1, h // 2, w // 2),
     ]
-    y, u, v = (
-        F.interpolate(p, size=size, mode="bilinear", antialias=True)[
-            :, 0, top : top + SIZE, left : left + SIZE
-        ].round()
-        for p in planes
-    )
+
+    def resize(p):
+        out = F.interpolate(p, size=size, mode="bilinear", antialias=True)
+        return out[:, 0, top : top + SIZE, left : left + SIZE].round()
+
+    y, u, v = (resize(p) for p in planes)
+    r_v, g_u, g_v, b_u = MATRIX[reader.info(vid).colorspace]
     yy, s, u, v = (y - 16) * 255 / 219, 255 / 224, u - 128, v - 128
     rgb = torch.stack(
         [
-            yy + 1.5748 * s * v,
-            yy - 0.187324 * s * u - 0.468124 * s * v,
-            yy + 1.8556 * s * u,
+            yy + r_v * s * v,
+            yy + g_u * s * u + g_v * s * v,
+            yy + b_u * s * u,
         ],
         1,
     )
     return rgb.round().clamp(0, 255).byte().numpy()
 
 
-def test_index_matches_moov(shards):
-    for path in shards:
-        indexed, parsed = Shard(path), Shard(path)
-        parsed.meta = None  # force the moov fallback
-        for i in range(len(indexed)):
-            a, b = indexed.video(i), parsed.video(i)
-            assert (a.n, a.h, a.w, a.codec) == (b.n, b.h, b.w, b.codec)
-            assert (
-                np.array_equal(a.off, b.off)
-                and np.array_equal(a.size, b.size)
-                and np.array_equal(a.keys, b.keys)
-            )
-            assert abs(a.fps - b.fps) < 1e-3 and a.prefix == b.prefix
+def picks(reader: Reader, pick: str, rng: random.Random) -> list[tuple[int, list[int]]]:
+    items = []
+    for vid in range(len(reader)):
+        v = reader.info(vid)
+        if pick == "clip6":
+            frames = clip(v.n, v.fps, 8, 6.0, rng)
+        elif pick == "clip24":
+            frames = clip(v.n, v.fps, 8, 24.0, rng)
+        elif pick == "random":
+            frames = random_frames(v.n, 8, rng)
+        else:
+            frames = [3, 3, 40, 40, 5, 5, 0, 0]
+        items.append((vid, frames))
+    return items
+
+
+def test_storage_format(shards):
+    reader = Reader(shards)
+    for vid in range(len(reader)):
+        v = reader.info(vid)
+        assert min(v.h, v.w) in (360, 512) and abs(v.fps - 30) < 1e-3
+        data = member_bytes(str(v.source), v.name)
+        assert data.index(b"moov") < data.index(b"mdat")  # faststart
 
 
 @pytest.mark.parametrize("pick", ["clip6", "clip24", "random", "repeat"])
 def test_frames_match_reference(shards, pick):
-    reader = Reader(shards, size=SIZE, threads=4, augment=Augment(crop="center"))
-    rng = random.Random(0)
-    items = []
-    for vid in range(len(reader)):
-        v = reader.info(vid)
-        frames = {
-            "clip6": lambda: clip(v.n, v.fps, 8, 6.0, rng),
-            "clip24": lambda: clip(v.n, v.fps, 8, 24.0, rng),
-            "random": lambda: random_frames(v.n, 8, rng),
-            "repeat": lambda: [3, 3, 40, 40, 5, 5, 0, 0],
-        }[pick]()
-        items.append((vid, frames))
+    reader = Reader(shards, size=SIZE, threads=4, crop="center")
+    items = picks(reader, pick, random.Random(0))
     out = reader.read(items).video
     for (vid, frames), got in zip(items, out):
-        shard, i = reader.videos[vid]
-        v = reader.info(vid)
-        s = SIZE / min(v.h, v.w)
-        nh, nw = max(SIZE, round(v.h * s)), max(SIZE, round(v.w * s))
-        ref = reference(shard, i, frames, (nh - SIZE) // 2, (nw - SIZE) // 2)
-        diff = np.abs(got.astype(int) - ref.astype(int))
+        diff = np.abs(got.astype(int) - reference(reader, vid, frames).astype(int))
         assert diff.mean() < 0.6 and np.percentile(diff, 99.9) <= 3, (
             pick,
             vid,
@@ -137,84 +168,93 @@ def test_frames_match_reference(shards, pick):
 
 
 def test_moov_fallback_is_bit_identical(shards):
+    indexed = Reader(shards, size=SIZE, crop="center")
+    parsed = Reader(shards, size=SIZE, crop="center", use_index=False)
+    for vid in range(len(indexed)):
+        a, b = indexed.info(vid), parsed.info(vid)
+        assert (a.n, a.h, a.w, a.codec, a.name) == (b.n, b.h, b.w, b.codec, b.name)
+        assert abs(a.fps - b.fps) < 1e-6
+
     items = [(0, [1, 5, 9, 30]), (1, [2, 3, 4, 50])]
-    a = Reader(shards, size=SIZE, augment=Augment(crop="center")).read(items).video
-    fallback = [Shard(p) for p in shards]
-    for s in fallback:
-        s.meta = None
-    b = Reader(fallback, size=SIZE, augment=Augment(crop="center")).read(items).video
-    assert np.array_equal(a, b)
+    assert np.array_equal(indexed.read(items).video, parsed.read(items).video)
 
 
 def test_skipping_unreferenced_samples_is_exact(shards):
-    reader = Reader(shards, size=SIZE, threads=4, augment=Augment(crop="center"))
+    fast = Reader(shards, size=SIZE, threads=4, crop="center")
+    full = Reader(shards, size=SIZE, threads=4, crop="center", skip=False)
     rng = random.Random(1)
-    items = [
-        (vid, clip(reader.info(vid).n, reader.info(vid).fps, 8, 6.0, rng))
-        for vid in range(len(reader))
-    ]
-    items += [
-        (vid, random_frames(reader.info(vid).n, 8, rng)) for vid in range(len(reader))
-    ]
-    fast = reader.read(items).video
-    reader.skip = False
-    assert np.array_equal(fast, reader.read(items).video)
+    items = picks(fast, "clip6", rng) + picks(fast, "random", rng)
+    assert np.array_equal(fast.read(items).video, full.read(items).video)
 
 
 def test_sources_agree(shards, tmp_path):
     """zip / tar archives (with the index and with the moov fallback) and a nested folder tree of
     the same mp4 files return the same clips."""
-    import tarfile
-    import zipfile
-
-    from kohakuclip.writer import pack
-
-    mp4s = []
+    members = []
     for k, path in enumerate(shards):
         with zipfile.ZipFile(path) as z:
             for name in z.namelist():
                 if name.endswith(".mp4"):
+                    members.append((name, z.read(name)))
                     dst = tmp_path / "tree" / f"part{k}" / "nested" / name
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     dst.write_bytes(z.read(name))
-                    mp4s.append(str(dst))
     tar = str(tmp_path / "all.tar")
-    pack(mp4s, tar)
+    _core.pack(tar, members)
     assert tarfile.is_tarfile(tar)
 
-    def fallback(path):
-        s = Shard(path)
-        s.meta = None
-        return s
-
     sources = {
-        "zip": list(shards),
-        "zip-moov": [fallback(p) for p in shards],
-        "tar": [tar],
-        "tar-moov": [fallback(tar)],
-        "folder": [str(tmp_path / "tree")],
+        "zip": {"sources": list(shards)},
+        "zip-moov": {"sources": list(shards), "use_index": False},
+        "tar": {"sources": [tar]},
+        "tar-moov": {"sources": [tar], "use_index": False},
+        "folder": {"sources": [str(tmp_path / "tree")]},
     }
     outs = {}
-    for label, src in sources.items():
-        reader = Reader(src, size=SIZE, augment=Augment(crop="center"))
-        names = [os.path.basename(s.members[i].name) for s, i in reader.videos]
-        by_name = {n: vid for vid, n in enumerate(names)}
+    for label, kwargs in sources.items():
+        reader = Reader(size=SIZE, crop="center", **kwargs)
+        by_name = {os.path.basename(reader.info(v).name): v for v in range(len(reader))}
         items = [(by_name[n], [0, 7, 21, 40]) for n in sorted(by_name)]
         outs[label] = reader.read(items).video
     for label, out in outs.items():
         assert np.array_equal(out, outs["zip"]), label
 
 
+def test_writer_inputs(sources, tmp_path):
+    """A tar of videos and in-memory bytes encode like the files themselves."""
+    tar = tmp_path / "videos.tar"
+    with tarfile.open(tar, "w") as t:
+        for path in sources:
+            t.add(path, os.path.basename(path))
+
+    enc = Encoding(crf=30)
+    from_files = Reader(
+        write(sources, str(tmp_path / "a"), enc, workers=3), crop="center"
+    )
+    from_tar = Reader(
+        write([str(tar)], str(tmp_path / "b"), enc, workers=3), crop="center"
+    )
+    assert len(from_files) == len(from_tar) == len(SOURCES)
+
+    items = [(v, [0, 10, 20]) for v in range(len(from_files))]
+    a = from_files.read(items).video
+    b = from_tar.read(items).video
+    assert np.array_equal(a, b)
+
+    with open(sources[0], "rb") as f:
+        data = f.read()
+    assert _core.encode(data, crf=30) == _core.encode(sources[0], crf=30)
+
+
 def test_yuv_matches_rgb(shards):
     """GPU-side conversion (run on the CPU here) of the stored-resolution yuv window vs rgb."""
     from kohakuclip.torch import yuv_to_rgb
 
-    rgb = Reader(shards, size=SIZE, augment=Augment(crop="center"))
-    yuv = Reader(shards, size=SIZE, mode="yuv", augment=Augment(crop="center"))
+    rgb = Reader(shards, size=SIZE, crop="center")
+    yuv = Reader(shards, size=SIZE, mode="yuv", crop="center")
     same = [v for v in range(len(rgb)) if min(rgb.info(v).h, rgb.info(v).w) == 360]
-    items = [
-        (v, [0, 9, 30]) for v in same
-    ]  # "yuv" needs a common stored short side per batch
+    # "yuv" needs a common stored short side per batch
+    items = [(v, [0, 9, 30]) for v in same]
     ref = torch.from_numpy(rgb.read(items).video).float()
     got = (yuv_to_rgb(yuv.read(items), SIZE, device="cpu") + 1) * 127.5
     psnr = 10 * np.log10(255**2 / ((got - ref) ** 2).mean().item())
@@ -222,14 +262,14 @@ def test_yuv_matches_rgb(shards):
 
 
 def test_yuv_resized_planes(shards):
-    """yuv_resized planes == the yuv window's planes resized in torch (Y to the crop, U / V to half)."""
-    yuv = Reader(shards, size=SIZE, mode="yuv", augment=Augment(crop="center"))
-    small = Reader(
-        shards, size=SIZE, mode="yuv_resized", augment=Augment(crop="center")
-    )
+    """yuv_resized planes == the yuv window's planes resized in torch (Y to the crop, U / V to
+    half)."""
+    yuv = Reader(shards, size=SIZE, mode="yuv", crop="center")
+    small = Reader(shards, size=SIZE, mode="yuv_resized", crop="center")
     same = [v for v in range(len(yuv)) if min(yuv.info(v).h, yuv.info(v).w) == 360]
     items = [(v, [0, 9, 30]) for v in same]
     a, b = yuv.read(items), small.read(items)
+
     side, n = int(a.window[0][0]), len(items) * 3
     x = torch.from_numpy(a.video).reshape(n, -1).float()
     y = torch.from_numpy(b.video).reshape(n, -1).float()
@@ -238,9 +278,20 @@ def test_yuv_resized_planes(shards):
         (side**2, side**2 * 5 // 4, side // 2, SIZE // 2),
     ):
         plane = x[:, lo:hi].reshape(n, 1, full, full)
-        ref = F.interpolate(plane, size=(out, out), mode="bilinear", antialias=True)[
-            :, 0
-        ]
+        ref = F.interpolate(plane, size=(out, out), mode="bilinear", antialias=True)
         o = SIZE**2 if lo else 0
         got = y[:, o : o + out * out].reshape(n, out, out)
-        assert (got - ref).abs().mean() < 1.0
+        assert (got - ref[:, 0]).abs().mean() < 1.0
+
+
+def test_dropping_a_pending_batch_is_safe(shards):
+    """A batch dropped before ``result()`` waits for its decode threads before its output array
+    is freed (they would otherwise write into freed memory)."""
+    import gc
+
+    reader = Reader(shards, size=SIZE, threads=4)
+    for _ in range(20):
+        pending = [reader.submit(reader.sample(4, 8, 6.0)) for _ in range(4)]
+        del pending
+        gc.collect()
+    assert reader.read(reader.sample(4, 8, 6.0)).video.shape == (4, 8, 3, SIZE, SIZE)

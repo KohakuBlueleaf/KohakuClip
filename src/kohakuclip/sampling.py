@@ -11,7 +11,7 @@ def clip(
     step = 1.0 if target_fps is None else fps / target_fps
     span = step * (frames - 1)
     start = rng.uniform(0, max(0.0, n - 1 - span))
-    return [min(n - 1, int(round(start + k * step))) for k in range(frames)]
+    return [min(n - 1, round(start + k * step)) for k in range(frames)]
 
 
 def random_frames(n: int, frames: int, rng: random.Random) -> list[int]:
