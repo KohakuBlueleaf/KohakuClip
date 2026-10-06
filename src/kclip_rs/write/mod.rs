@@ -11,7 +11,10 @@ mod pack;
 
 use std::ffi::{CStr, CString};
 
+use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avutil::AVDictionary;
+use rsmpeg::error::RsmpegError;
+use rsmpeg::ffi;
 
 pub use encode::{Source, encode};
 pub use pack::pack;
@@ -86,4 +89,24 @@ impl Encoding {
         }
         Ok((name, dict))
     }
+}
+
+/// Open an encoder with options. `avcodec_open2` frees the options dictionary it is given and
+/// hands back one of the unused entries, also when opening fails; rsmpeg's `open` frees the
+/// original again on failure (a double free, e.g. when SVT-AV1 rejects a parameter), so the
+/// dictionary is owned here instead.
+pub(crate) fn open_encoder(
+    context: &mut AVCodecContext,
+    options: AVDictionary,
+) -> Result<(), String> {
+    let mut dict = options.into_raw().as_ptr();
+    // SAFETY: the context is allocated and not opened; `dict` is a valid dictionary that
+    // avcodec_open2 replaces in place
+    let ret = unsafe { ffi::avcodec_open2(context.as_mut_ptr(), std::ptr::null(), &mut dict) };
+    // SAFETY: whatever avcodec_open2 left in `dict` (unused entries, or null) belongs to us
+    unsafe { ffi::av_dict_free(&mut dict) };
+    if ret < 0 {
+        return Err(format!("open encoder: {}", RsmpegError::AVError(ret)));
+    }
+    Ok(())
 }

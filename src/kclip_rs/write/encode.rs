@@ -10,8 +10,8 @@ use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 
-use super::Encoding;
 use super::memio::{MemFile, custom_io};
+use super::{Encoding, open_encoder};
 use crate::mp4;
 
 /// A video to encode: a path FFmpeg can open, or the bytes of a video file.
@@ -56,9 +56,16 @@ impl Color {
                 sd_value
             }
         };
+        // the output is YUV 4:2:0, which an RGB (identity) matrix cannot describe (SVT-AV1
+        // rejects it): a YUV source tagged so is mistagged, and read as untagged
+        let matrix = if dec.colorspace == ffi::AVCOL_SPC_RGB {
+            ffi::AVCOL_SPC_UNSPECIFIED
+        } else {
+            dec.colorspace
+        };
         Self {
             matrix: pick(
-                dec.colorspace,
+                matrix,
                 ffi::AVCOL_SPC_UNSPECIFIED,
                 ffi::AVCOL_SPC_BT709,
                 ffi::AVCOL_SPC_SMPTE170M,
@@ -157,9 +164,7 @@ pub fn encode(source: Source, enc: &Encoding) -> Result<Vec<u8>, String> {
         (*raw).color_primaries = color.primaries;
         (*raw).color_trc = color.transfer;
     }
-    encoder_ctx
-        .open(Some(options))
-        .map_err(err("open encoder"))?;
+    open_encoder(&mut encoder_ctx, options)?;
 
     let out_index = {
         let mut out_stream = muxer.new_stream();

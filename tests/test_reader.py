@@ -295,3 +295,53 @@ def test_dropping_a_pending_batch_is_safe(shards):
         del pending
         gc.collect()
     assert reader.read(reader.sample(4, 8, 6.0)).video.shape == (4, 8, 3, SIZE, SIZE)
+
+
+def isolated(code: str) -> str:
+    """Run ``code`` in a fresh interpreter (a crash fails the test instead of killing pytest);
+    returns its stdout. A Rust panic (reported by pyo3, the process survives) fails too.
+    """
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, f"exit {done.returncode}: {done.stderr[-2000:]}"
+    assert "panicked" not in done.stderr, done.stderr[-2000:]
+    return done.stdout
+
+
+def test_mistagged_matrix_and_encoder_errors(tmp_path):
+    """A YUV source tagged with the RGB (identity) matrix is encoded as untagged (SVT-AV1
+    rejects that matrix for 4:2:0), and an encoder that fails to open raises instead of
+    crashing."""
+    src = str(tmp_path / "rgb_tagged.mp4")
+    cmd = [
+        FFMPEG,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=30:duration=1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-bsf:v",
+        "h264_metadata=matrix_coefficients=0",
+        src,
+    ]
+    subprocess.run(cmd, check=True)
+    shard = str(tmp_path / "shard.zip")
+    out = isolated(f"""
+from kohakuclip import Reader, _core
+_core.pack({shard!r}, [("a.mp4", _core.encode({src!r}, crf=40, preset=12))])
+print(Reader([{shard!r}]).info(0).colorspace)
+try:
+    _core.encode({src!r}, crf=99)
+except RuntimeError as e:
+    print("raised", e)
+""")
+    lines = out.splitlines()
+    assert lines[0] == "bt601"  # the SD guess for an untagged source
+    assert lines[1].startswith("raised open encoder")
+
