@@ -1,13 +1,17 @@
-//! Pixels: antialiased resize fused with the crop, YUV -> RGB conversion, window copies.
+//! Pixels: decoded pictures, antialiased resize fused with the crop, YUV -> RGB conversion,
+//! window copies.
 
 mod color;
+mod picture;
 mod resize;
 mod simd;
 
-pub use color::{Matrix, to_rgb};
-pub use resize::resize_plane;
+pub use color::{Matrix, rgb_to_yuv, to_rgb};
+pub use picture::{Color, Picture, split_packed};
+pub use resize::{Filter, resize_plane, resize_plane_with};
+pub use simd::transpose;
 
-/// A plane of a decoded frame.
+/// A plane of a decoded picture.
 #[derive(Clone, Copy)]
 pub struct Plane<'a> {
     pub data: &'a [u8],

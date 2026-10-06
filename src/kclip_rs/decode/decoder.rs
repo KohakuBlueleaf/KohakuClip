@@ -13,7 +13,8 @@ pub struct Decoders {
     pub packet: AVPacket,
     pub frame: AVFrame,
     pub bytes: Vec<u8>,
-    pub planes: Vec<u8>,
+    /// A packed picture split into planes, and the resized planes of the rgb mode.
+    pub buffers: (Vec<u8>, Vec<u8>),
 }
 
 impl Decoders {
@@ -23,7 +24,7 @@ impl Decoders {
             packet: AVPacket::new(),
             frame: AVFrame::new(),
             bytes: Vec::new(),
-            planes: Vec::new(),
+            buffers: (Vec::new(), Vec::new()),
         }
     }
 }

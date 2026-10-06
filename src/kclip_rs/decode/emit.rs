@@ -1,101 +1,153 @@
-//! The output pixels of one decoded frame, per output mode.
-
-use rsmpeg::avutil::AVFrame;
-use rsmpeg::ffi;
+//! The output pixels of one decoded picture (a video frame or a still image), per output mode.
 
 use super::profile::{Stage, timed};
-use crate::image::{Grid, Matrix, Plane, copy_window, resize_plane, to_rgb};
-use crate::read::plan::{ClipPlan, Mode};
+use crate::image::{Color, Grid, Matrix, Picture, copy_window, resize_plane, to_rgb};
+use crate::read::plan::Mode;
 
-/// The conversion applied for a frame's matrix coefficients: BT.601 only when tagged so;
-/// untagged video is read as BT.709 (the writer tags untagged SD sources as BT.601 explicitly).
-pub fn colorspace_name(matrix: ffi::AVColorSpace) -> &'static str {
-    match matrix {
-        ffi::AVCOL_SPC_BT470BG | ffi::AVCOL_SPC_SMPTE170M | ffi::AVCOL_SPC_FCC => "bt601",
-        _ => "bt709",
-    }
+/// Where a picture's output pixels come from and how they are written.
+#[derive(Clone, Copy, Debug)]
+pub struct Output {
+    /// The picture conceptually resized to (nh, nw), then the (oh, ow) window.
+    pub grid: Grid,
+    pub hflip: bool,
+    pub vflip: bool,
+    pub mode: Mode,
 }
 
-/// Plane `p` of a decoded frame, with its subsampled size.
-fn plane(frame: &AVFrame, p: usize, chroma_shift: (u32, u32)) -> Plane<'_> {
-    let (h, w) = (frame.height as usize, frame.width as usize);
-    let (h, w) = if p == 0 {
-        (h, w)
-    } else {
-        (
-            h.div_ceil(1 << chroma_shift.0),
-            w.div_ceil(1 << chroma_shift.1),
-        )
-    };
-    let stride = frame.linesize[p] as usize;
-    // SAFETY: an 8-bit planar frame holds h rows of `stride` bytes per plane
-    let data = unsafe { std::slice::from_raw_parts(frame.data[p], stride * (h - 1) + w) };
-    Plane { data, stride, h, w }
-}
-
-/// Write the output pixels of `frame` into `dst` (one output slot).
+/// Write the output pixels of `picture` into `dst` (one output slot). `scratch` holds the
+/// resized planes of the rgb mode between the resize and the conversion.
 pub fn emit(
-    plan: &ClipPlan,
-    frame: &AVFrame,
+    picture: &Picture,
+    out: &Output,
     dst: &mut [u8],
-    planes: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), String> {
-    // SAFETY: the pixel format of a decoded frame always has a descriptor
-    let desc = unsafe { &*ffi::av_pix_fmt_desc_get(frame.format) };
-    if desc.comp[0].depth != 8 || desc.nb_components < 3 {
-        return Err("only 8-bit YUV video is supported".into());
+    match out.mode {
+        Mode::Yuv => timed(Stage::Convert, || stored_window(picture, &out.grid, dst)),
+        Mode::YuvResized => timed(Stage::Resize, || resized_planes(picture, &out.grid, dst)),
+        Mode::Rgb => rgb(picture, out, dst, scratch),
     }
-    let shift = (desc.log2_chroma_h as u32, desc.log2_chroma_w as u32);
-    let (y, u, v) = (
-        plane(frame, 0, shift),
-        plane(frame, 1, shift),
-        plane(frame, 2, shift),
-    );
+}
 
-    let g = plan.geometry;
-    let grid = Grid {
-        nh: g.nh as f64,
-        nw: g.nw as f64,
-        top: g.top as f64,
-        left: g.left as f64,
-        oh: g.oh as usize,
-        ow: g.ow as usize,
-    };
+/// "yuv": the (oh, ow) window at (top, left) of the stored planes as 4:2:0: copied as they are
+/// (4:2:0 pictures), or with the chroma resampled (other subsamplings).
+fn stored_window(picture: &Picture, grid: &Grid, dst: &mut [u8]) -> Result<(), String> {
     let (oh, ow) = (grid.oh, grid.ow);
+    let (top, left) = (grid.top as usize, grid.left as usize);
     let n = oh * ow;
+    let (luma, chroma) = dst.split_at_mut(n);
+    let (cb, cr) = chroma.split_at_mut(n / 4);
+    let [y, u, v] = picture.planes;
 
-    match plan.mode {
-        Mode::Yuv => timed(Stage::Convert, || {
-            let (top, left) = (g.top as usize, g.left as usize);
-            let (luma, chroma) = dst.split_at_mut(n);
-            let (cb, cr) = chroma.split_at_mut(n / 4);
+    match picture.color {
+        Color::Yuv { .. } => {
             copy_window(y, top, left, oh, ow, luma);
-            copy_window(u, top / 2, left / 2, oh / 2, ow / 2, cb);
-            copy_window(v, top / 2, left / 2, oh / 2, ow / 2, cr);
-        }),
-        Mode::YuvResized => timed(Stage::Resize, || {
-            let (luma, chroma) = dst.split_at_mut(n);
-            let (cb, cr) = chroma.split_at_mut(n / 4);
-            resize_plane(y, &grid, luma);
+            let (h, w) = picture.size();
+            if u.h == h.div_ceil(2) && u.w == w.div_ceil(2) {
+                copy_window(u, top / 2, left / 2, oh / 2, ow / 2, cb);
+                copy_window(v, top / 2, left / 2, oh / 2, ow / 2, cr);
+            } else {
+                // other subsamplings (4:4:4 JPEGs): chroma resampled onto the 4:2:0 grid
+                resize_plane(u, &grid.half(), cb);
+                resize_plane(v, &grid.half(), cr);
+            }
+        }
+        Color::Gray => {
+            copy_window(y, top, left, oh, ow, luma);
+            cb.fill(128);
+            cr.fill(128);
+        }
+        Color::Rgb => return Err("yuv modes need YUV-coded pictures".into()),
+    }
+    Ok(())
+}
+
+/// "yuv_resized": luma resized to the output grid, chroma to the same grid at half resolution.
+fn resized_planes(picture: &Picture, grid: &Grid, dst: &mut [u8]) -> Result<(), String> {
+    let n = grid.oh * grid.ow;
+    let (luma, chroma) = dst.split_at_mut(n);
+    let (cb, cr) = chroma.split_at_mut(n / 4);
+    let [y, u, v] = picture.planes;
+
+    match picture.color {
+        Color::Yuv { .. } => {
+            resize_plane(y, grid, luma);
             resize_plane(u, &grid.half(), cb);
             resize_plane(v, &grid.half(), cr);
-        }),
-        Mode::Rgb => {
-            planes.resize(3 * n, 0);
-            let (py, rest) = planes.split_at_mut(n);
+        }
+        Color::Gray => {
+            resize_plane(y, grid, luma);
+            cb.fill(128);
+            cr.fill(128);
+        }
+        Color::Rgb => return Err("yuv modes need YUV-coded pictures".into()),
+    }
+    Ok(())
+}
+
+/// "rgb": every plane resized onto the output grid, then converted (YUV) or copied (RGB, gray)
+/// into R, G, B with the flips.
+fn rgb(
+    picture: &Picture,
+    out: &Output,
+    dst: &mut [u8],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let grid = &out.grid;
+    let (oh, ow) = (grid.oh, grid.ow);
+    let n = oh * ow;
+    let [y, u, v] = picture.planes;
+
+    match picture.color {
+        Color::Yuv { bt709, full_range } => {
+            scratch.resize(3 * n, 0);
+            let (py, rest) = scratch.split_at_mut(n);
             let (pu, pv) = rest.split_at_mut(n);
             timed(Stage::Resize, || {
-                resize_plane(y, &grid, py);
-                resize_plane(u, &grid, pu);
-                resize_plane(v, &grid, pv);
+                resize_plane(y, grid, py);
+                resize_plane(u, grid, pu);
+                resize_plane(v, grid, pv);
             });
-            let bt709 = colorspace_name(frame.colorspace) == "bt709";
-            let full_range = frame.color_range == ffi::AVCOL_RANGE_JPEG;
             let matrix = Matrix::new(bt709, full_range);
             timed(Stage::Convert, || {
-                to_rgb(py, pu, pv, &matrix, oh, ow, g.hflip, g.vflip, dst);
+                to_rgb(py, pu, pv, &matrix, oh, ow, out.hflip, out.vflip, dst);
+            });
+        }
+        Color::Rgb => {
+            timed(Stage::Resize, || {
+                for (plane, channel) in picture.planes.iter().zip(dst.chunks_exact_mut(n)) {
+                    resize_plane(*plane, grid, channel);
+                }
+            });
+            timed(Stage::Convert, || {
+                flip_channels(dst, oh, ow, out.hflip, out.vflip)
+            });
+        }
+        Color::Gray => {
+            timed(Stage::Resize, || resize_plane(y, grid, &mut dst[..n]));
+            timed(Stage::Convert, || {
+                dst.copy_within(..n, n);
+                dst.copy_within(..n, 2 * n);
+                flip_channels(dst, oh, ow, out.hflip, out.vflip);
             });
         }
     }
     Ok(())
+}
+
+/// Flip each (oh, ow) channel of `dst` in place.
+fn flip_channels(dst: &mut [u8], oh: usize, ow: usize, hflip: bool, vflip: bool) {
+    for channel in dst.chunks_exact_mut(oh * ow) {
+        if vflip {
+            for row in 0..oh / 2 {
+                let (upper, lower) = channel.split_at_mut((oh - 1 - row) * ow);
+                upper[row * ow..(row + 1) * ow].swap_with_slice(&mut lower[..ow]);
+            }
+        }
+        if hflip {
+            for row in channel.chunks_exact_mut(ow) {
+                row.reverse();
+            }
+        }
+    }
 }

@@ -15,6 +15,11 @@ static STAGE_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub static EMITTED: AtomicU64 = AtomicU64::new(0);
 pub static DECODED: AtomicU64 = AtomicU64::new(0);
 
+/// Add `elapsed` to a stage (for spans that a closure cannot wrap).
+pub fn add(stage: Stage, elapsed: std::time::Duration) {
+    STAGE_NS[stage as usize].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
 pub fn timed<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
     let out = f();

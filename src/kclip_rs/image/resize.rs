@@ -1,13 +1,55 @@
-//! Antialiased bilinear resize fused with the crop, per plane.
+//! Antialiased resize fused with the crop, per plane.
 //!
-//! Same filter as `torch.nn.functional.interpolate(mode="bilinear", antialias=True)` (PIL
-//! BILINEAR): Q14 weights, uint8 intermediates, two separable passes. Chroma planes use the same
-//! call; their taps map the smaller plane straight onto the output grid.
+//! The reader's filter is bilinear, the same as
+//! `torch.nn.functional.interpolate(mode="bilinear", antialias=True)` (PIL BILINEAR); the writer
+//! downscales with Lanczos-3 (PIL LANCZOS). Q14 weights, uint8 intermediates, two separable
+//! passes. Chroma planes use the same call; their taps map the smaller plane straight onto the
+//! output grid.
 
 use std::cell::RefCell;
 
 use super::simd::{self, transpose};
 use super::{Grid, Plane};
+
+/// The resampling filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// Triangle, support 1 (the reader).
+    Bilinear,
+    /// Windowed sinc, support 3 (the writer), when shrinking; bilinear when enlarging.
+    Lanczos3,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Bilinear => 1.0,
+            Filter::Lanczos3 => 3.0,
+        }
+    }
+
+    /// The filter's weight at `x` input samples (scaled to the output) from the center.
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            Filter::Bilinear => (1.0 - x.abs()).max(0.0),
+            Filter::Lanczos3 => {
+                if x.abs() >= 3.0 {
+                    0.0
+                } else {
+                    sinc(x) * sinc(x / 3.0)
+                }
+            }
+        }
+    }
+}
+
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        return 1.0;
+    }
+    let x = x * std::f64::consts::PI;
+    x.sin() / x
+}
 
 /// Filter taps of every output sample along one axis.
 #[derive(Default)]
@@ -23,10 +65,17 @@ struct Taps {
 
 impl Taps {
     /// Taps for outputs `out0 + [0, outn)` of `input` samples resized to `out`.
-    fn build(&mut self, input: usize, out: f64, out0: f64, outn: usize) {
+    fn build(&mut self, input: usize, out: f64, out0: f64, outn: usize, filter: Filter) {
         let scale = input as f64 / out;
-        let support = scale.max(1.0);
-        let inverse = 1.0 / support;
+        // Lanczos-3 when shrinking; enlarging (e.g. 4:2:0 chroma onto a 4:4:4 grid) is bilinear
+        let filter = if scale < 1.0 {
+            Filter::Bilinear
+        } else {
+            filter
+        };
+        let stretch = scale.max(1.0);
+        let support = filter.support() * stretch;
+        let inverse = 1.0 / stretch;
         self.max = support.ceil() as usize * 2 + 1;
         self.first.clear();
         self.count.clear();
@@ -42,8 +91,8 @@ impl Taps {
 
             let mut total = 0.0;
             for (j, wj) in w.iter_mut().take(n).enumerate() {
-                let distance = ((j + lo) as f64 - center + 0.5).abs() * inverse;
-                *wj = (1.0 - distance).max(0.0);
+                let distance = ((j + lo) as f64 - center + 0.5) * inverse;
+                *wj = filter.weight(distance);
                 total += *wj;
             }
             let row = &mut self.weights[i * self.max..i * self.max + n];
@@ -99,14 +148,28 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
+/// Resize and crop `src` as `grid` says into `dst` (oh * ow bytes) with the bilinear filter.
+pub fn resize_plane(src: Plane, grid: &Grid, dst: &mut [u8]) {
+    resize_plane_with(src, grid, Filter::Bilinear, dst);
+}
+
 /// Resize and crop `src` as `grid` says into `dst` (oh * ow bytes): a vertical pass over the
 /// needed rows (only the window the crop needs), then the horizontal pass as a vertical pass on
 /// the transposed result.
-pub fn resize_plane(src: Plane, grid: &Grid, dst: &mut [u8]) {
+pub fn resize_plane_with(src: Plane, grid: &Grid, filter: Filter, dst: &mut [u8]) {
+    // a plane already at the grid's resolution, at a whole-sample offset: a copy of the window
+    // (what the filter's (1, 0) taps give, bit for bit)
+    let whole = |x: f64| x.fract() == 0.0 && x >= 0.0;
+    let same_size = grid.nh == src.h as f64 && grid.nw == src.w as f64;
+    if same_size && whole(grid.top) && whole(grid.left) {
+        let (top, left) = (grid.top as usize, grid.left as usize);
+        super::copy_window(src, top, left, grid.oh, grid.ow, dst);
+        return;
+    }
     SCRATCH.with_borrow_mut(|s| {
         let (oh, ow) = (grid.oh, grid.ow);
-        s.tx.build(src.w, grid.nw, grid.left, ow);
-        s.ty.build(src.h, grid.nh, grid.top, oh);
+        s.tx.build(src.w, grid.nw, grid.left, ow, filter);
+        s.ty.build(src.h, grid.nh, grid.top, oh, filter);
         let x0 = s.tx.first[0];
         let width = s.tx.first[ow - 1] + s.tx.count[ow - 1] - x0;
 
@@ -139,6 +202,67 @@ pub fn resize_plane(src: Plane, grid: &Grid, dst: &mut [u8]) {
         }
         transpose(&s.horizontal, ow, oh, dst);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lanczos-3 keeps a flat plane flat (the weights, negative lobes included, sum to one).
+    #[test]
+    fn lanczos_keeps_flat_planes() {
+        let (h, w) = (64usize, 90usize);
+        let flat = vec![137u8; h * w];
+        let plane = Plane {
+            data: &flat,
+            stride: w,
+            h,
+            w,
+        };
+        let grid = Grid {
+            nh: 32.0,
+            nw: 45.0,
+            top: 0.0,
+            left: 0.0,
+            oh: 32,
+            ow: 45,
+        };
+        let mut out = vec![0u8; 32 * 45];
+        resize_plane_with(plane, &grid, Filter::Lanczos3, &mut out);
+        assert!(out.iter().all(|&v| v == 137));
+    }
+
+    /// A 1:1 grid (copied) gives what the filter gives at that scale.
+    #[test]
+    fn identity_grid_is_a_copy() {
+        let (h, w) = (40usize, 70usize);
+        let data: Vec<u8> = (0..h * w).map(|i| (i * 29 % 251) as u8).collect();
+        let plane = Plane {
+            data: &data,
+            stride: w,
+            h,
+            w,
+        };
+        let grid = Grid {
+            nh: h as f64,
+            nw: w as f64,
+            top: 3.0,
+            left: 5.0,
+            oh: 32,
+            ow: 48,
+        };
+        let mut copied = vec![0u8; 32 * 48];
+        resize_plane(plane, &grid, &mut copied);
+
+        // the same grid nudged off the shortcut by a sub-ulp left offset goes through the filter
+        let nudged = Grid {
+            left: 5.0 + 1e-12,
+            ..grid
+        };
+        let mut filtered = vec![0u8; 32 * 48];
+        resize_plane(plane, &nudged, &mut filtered);
+        assert_eq!(copied, filtered);
+    }
 }
 
 #[cfg(test)]
@@ -201,8 +325,8 @@ mod bench {
 
         // the parts of one luma resize
         let mut s = Scratch::default();
-        s.tx.build(w, grid.nw, grid.left, 256);
-        s.ty.build(h, grid.nh, grid.top, 256);
+        s.tx.build(w, grid.nw, grid.left, 256, Filter::Bilinear);
+        s.ty.build(h, grid.nh, grid.top, 256, Filter::Bilinear);
         let x0 = s.tx.first[0];
         let width = s.tx.first[255] + s.tx.count[255] - x0;
         s.vertical.resize(256 * width, 0);

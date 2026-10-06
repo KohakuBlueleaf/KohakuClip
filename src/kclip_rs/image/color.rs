@@ -77,3 +77,57 @@ fn convert_row(y: &[u8], u: &[u8], v: &[u8], m: &Matrix, r: &mut [u8], g: &mut [
         *b = pixel(luma + m.b_u * cb);
     }
 }
+
+/// R, G, B planes -> full-range BT.601 Y, Cb, Cr planes of the same size (the JPEG convention;
+/// Q14 fixed point, rounded).
+pub fn rgb_to_yuv(r: &[u8], g: &[u8], b: &[u8], y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    let q = |c: f64| (c * 16384.0).round() as i32;
+    let (yr, yg, yb) = (q(0.299), q(0.587), q(0.114));
+    let (ur, ug, ub) = (q(-0.168_736), q(-0.331_264), q(0.5));
+    let (vr, vg, vb) = (q(0.5), q(-0.418_688), q(-0.081_312));
+    let half = 1 << 13;
+    let center = 128 << 14;
+    let pixel = |c: i32| (c >> 14).clamp(0, 255) as u8;
+
+    let inputs = r.iter().zip(g).zip(b);
+    let outputs = y.iter_mut().zip(u.iter_mut()).zip(v.iter_mut());
+    for (((&r, &g), &b), ((y, u), v)) in inputs.zip(outputs) {
+        let (r, g, b) = (r as i32, g as i32, b as i32);
+        *y = pixel(yr * r + yg * g + yb * b + half);
+        *u = pixel(ur * r + ug * g + ub * b + center + half);
+        *v = pixel(vr * r + vg * g + vb * b + center + half);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RGB -> YCbCr -> RGB (full range BT.601) returns within rounding.
+    #[test]
+    fn rgb_yuv_round_trip() {
+        let n = 4096;
+        let r: Vec<u8> = (0..n).map(|i| (i * 37 % 256) as u8).collect();
+        let g: Vec<u8> = (0..n).map(|i| (i * 91 % 256) as u8).collect();
+        let b: Vec<u8> = (0..n).map(|i| (i * 53 % 256) as u8).collect();
+        let (mut y, mut u, mut v) = (vec![0; n], vec![0; n], vec![0; n]);
+        rgb_to_yuv(&r, &g, &b, &mut y, &mut u, &mut v);
+        let mut back = vec![0u8; 3 * n];
+        to_rgb(
+            &y,
+            &u,
+            &v,
+            &Matrix::new(false, true),
+            1,
+            n,
+            false,
+            false,
+            &mut back,
+        );
+        for (channel, original) in back.chunks_exact(n).zip([&r, &g, &b]) {
+            for (&got, &want) in channel.iter().zip(original.iter()) {
+                assert!((got as i32 - want as i32).abs() <= 2, "{got} vs {want}");
+            }
+        }
+    }
+}
