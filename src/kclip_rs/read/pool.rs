@@ -77,15 +77,22 @@ impl<T> Batch<T> {
         }
     }
 
-    /// Block until every task finished; returns their results in order.
-    pub fn wait(&self) -> Vec<T> {
+    /// Block until every task finished.
+    pub fn join(&self) {
         let mut results = self.results.lock().unwrap();
         while self.left.load(Ordering::Acquire) > 0 {
             results = self.done.wait(results).unwrap();
         }
+    }
+
+    /// Block until every task finished; returns their results in order. Call it once: the
+    /// results are moved out.
+    pub fn wait(&self) -> Vec<T> {
+        self.join();
+        let mut results = self.results.lock().unwrap();
         results
             .iter_mut()
-            .map(|r| r.take().expect("task finished"))
+            .map(|r| r.take().expect("results are taken once"))
             .collect()
     }
 }

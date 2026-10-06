@@ -2,14 +2,15 @@
 //! without the GIL.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use numpy::{PyArray2, PyArrayDyn, PyArrayMethods, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+use super::pending::{OutRegion, Pending};
 use crate::decode::decode_clip;
 use crate::read::plan::{self, Augment, ClipPlan, Mode};
 use crate::read::pool::{self, Pool};
@@ -42,50 +43,6 @@ pub struct Batch {
     pub flips: Option<Py<PyAny>>,
     pub colorspace: Option<Vec<String>>,
 }
-
-/// A submitted batch; ``result()`` waits for it.
-#[pyclass(module = "kohakuclip._core")]
-pub struct Pending {
-    done: Arc<pool::Batch<Result<(), String>>>,
-    batch: Option<Batch>,
-}
-
-#[pymethods]
-impl Pending {
-    /// Wait (without the GIL) until the batch is decoded and return it.
-    fn result(&mut self, py: Python<'_>) -> PyResult<Batch> {
-        let done = self.done.clone();
-        let results = py.detach(move || done.wait());
-        let failed: Vec<String> = results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("clip {i}: {e}")))
-            .collect();
-        if !failed.is_empty() {
-            return Err(PyRuntimeError::new_err(failed.join("; ")));
-        }
-        self.batch
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("result() was already taken"))
-    }
-}
-
-impl Drop for Pending {
-    /// A batch dropped before `result()` still has decode threads writing into its output
-    /// array: wait for them before the array can be freed.
-    fn drop(&mut self) {
-        if self.batch.is_some() {
-            self.done.wait();
-        }
-    }
-}
-
-/// Raw output pointer handed to the decode threads.
-struct Out(*mut u8, usize);
-
-// SAFETY: every clip writes only its own disjoint region of the output array, and the array is
-// kept alive (owned by the pending `Batch`) until all tasks are waited for
-unsafe impl Send for Out {}
 
 /// Reads batches of clips from zip / tar archives and folders of mp4 files.
 #[pyclass(module = "kohakuclip._core", frozen)]
@@ -391,12 +348,11 @@ impl Reader {
         let done = pool::Batch::new(plans.len());
         for (i, plan) in plans.into_iter().enumerate() {
             // SAFETY: clip i owns bytes [i * clip_len, (i + 1) * clip_len) of the array
-            let region = Out(unsafe { base.add(i * clip_len) }, clip_len);
+            let region = unsafe { OutRegion::new(base, i, clip_len) };
             let done = done.clone();
             self.pool.spawn(move || {
-                let region = region;
-                // SAFETY: see `Out`: a disjoint region of a live array
-                let out = unsafe { std::slice::from_raw_parts_mut(region.0, region.1) };
+                // SAFETY: the pending batch keeps the array alive until every task finished
+                let out = unsafe { region.into_slice() };
                 done.finish(i, decode_clip(&plan, out));
             });
         }
@@ -423,10 +379,7 @@ impl Reader {
                 colorspace: Some(colorspace),
             }
         };
-        Ok(Pending {
-            done,
-            batch: Some(batch),
-        })
+        Ok(Pending::new(done, Py::new(py, batch)?.into_any(), "clip"))
     }
 
     /// ``submit(items, out, seed).result()``.
@@ -437,7 +390,7 @@ impl Reader {
         items: Vec<(usize, Vec<u32>)>,
         out: Option<Bound<'py, PyArrayDyn<u8>>>,
         seed: Option<u64>,
-    ) -> PyResult<Batch> {
+    ) -> PyResult<Py<PyAny>> {
         self.submit(py, items, out, seed)?.result(py)
     }
 }

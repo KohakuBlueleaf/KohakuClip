@@ -345,3 +345,27 @@ except RuntimeError as e:
     assert lines[0] == "bt601"  # the SD guess for an untagged source
     assert lines[1].startswith("raised open encoder")
 
+
+def test_dropping_a_failed_batch_is_safe(shards, tmp_path):
+    """A batch whose ``result()`` raised can be dropped (its threads are done; no second wait)."""
+    v = Reader(shards).info(0)
+    folder = tmp_path / "videos"
+    folder.mkdir()
+    path = folder / "a.mp4"
+    path.write_bytes(member_bytes(str(v.source), v.name))
+    out = isolated(f"""
+import gc, os
+from kohakuclip import Reader
+reader = Reader([{str(folder)!r}], size=64)
+items = [(0, [0, 1, 2, 40])]  # parses the moov now
+os.truncate({str(path)!r}, os.path.getsize({str(path)!r}) // 3)  # the samples are gone
+pending = reader.submit(items)
+try:
+    pending.result()
+except RuntimeError as e:
+    print("raised", e)
+del pending
+gc.collect()
+print("alive")
+""")
+    assert "raised" in out and out.strip().endswith("alive")
