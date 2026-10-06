@@ -2,9 +2,10 @@
 
 Per output pixel: antialiased bilinear taps over the stored window (none when the window already
 has the output size, ``mode="yuv_resized"``), for each tap the luma sample, the chroma bilinearly
-upsampled from 4:2:0 and the limited-range YUV -> RGB conversion (clamped), then the flips and the
-[-1, 1] scaling. Same math, in the same order, as ``kohakuclip.torch.yuv_to_rgb_torch``; reads the
-uint8 planes once and writes the output once.
+upsampled from 4:2:0 and the YUV -> RGB conversion (limited range, or full range for "-full"
+colorspaces such as JPEG's; clamped), then the flips and the [-1, 1] scaling. Same math, in the
+same order, as ``kohakuclip.torch.yuv_to_rgb_torch``; reads the uint8 planes once and writes the
+output once.
 """
 
 import math
@@ -13,11 +14,22 @@ import torch
 import triton
 import triton.language as tl
 
-# YUV (limited range) -> RGB: (R from V, G from U, G from V, B from U)
+# YUV -> RGB: (R from V, G from U, G from V, B from U)
 COEFFICIENTS = {
     "bt709": (1.5748, -0.187324, -0.468124, 1.8556),
     "bt601": (1.402, -0.344136, -0.714136, 1.772),
 }
+
+
+def color_coefficients(colorspace: str) -> list[float]:
+    """The kernel's 7 conversion constants of a colorspace name ("bt709", "bt601", with
+    "-full" for full range): the 4 matrix coefficients, the luma offset, the luma scale and the
+    chroma scale (to [0, 1] / [-0.5, 0.5])."""
+    matrix, _, value_range = colorspace.partition("-")
+    coefficients = list(COEFFICIENTS[matrix])
+    if value_range == "full":
+        return coefficients + [0.0, 1 / 255, 1 / 255]
+    return coefficients + [16.0, 1 / 219, 1 / 224]
 
 
 @triton.jit
@@ -42,7 +54,7 @@ def _chroma(plane, cy, cx, ch, cw):
 def _yuv_to_rgb_kernel(
     src,  # uint8 [N, H * W * 3 / 2]
     dst,  # [N, 3, S, S]
-    coef,  # float32 [N, 4]
+    coef,  # float32 [N, 7]: matrix, luma offset, luma scale, chroma scale
     flips,  # int8 [N, 2]
     H,
     W,
@@ -59,10 +71,13 @@ def _yuv_to_rgb_kernel(
     plane_y = src + frame.to(tl.int64) * (H * W * 3 // 2)
     plane_u = plane_y + H * W
     plane_v = plane_u + (H // 2) * (W // 2)
-    r_v = tl.load(coef + frame * 4 + 0)
-    g_u = tl.load(coef + frame * 4 + 1)
-    g_v = tl.load(coef + frame * 4 + 2)
-    b_u = tl.load(coef + frame * 4 + 3)
+    r_v = tl.load(coef + frame * 7 + 0)
+    g_u = tl.load(coef + frame * 7 + 1)
+    g_v = tl.load(coef + frame * 7 + 2)
+    b_u = tl.load(coef + frame * 7 + 3)
+    y_offset = tl.load(coef + frame * 7 + 4)
+    y_scale = tl.load(coef + frame * 7 + 5)
+    c_scale = tl.load(coef + frame * 7 + 6)
 
     # antialiased bilinear taps (as torch antialias=True): support = max(scale, 1)
     scale_y = H / S
@@ -106,9 +121,9 @@ def _yuv_to_rgb_kernel(
             u = _chroma(plane_u, cy, cx, H // 2, W // 2)
             v = _chroma(plane_v, cy, cx, H // 2, W // 2)
 
-            yy = (luma - 16.0) / 219.0
-            u = (u - 128.0) / 224.0
-            v = (v - 128.0) / 224.0
+            yy = (luma - y_offset) * y_scale
+            u = (u - 128.0) * c_scale
+            v = (v - 128.0) * c_scale
             w = wy * wx
             r += w * tl.minimum(tl.maximum(yy + r_v * v, 0.0), 1.0)
             g += w * tl.minimum(tl.maximum(yy + g_u * u + g_v * v, 0.0), 1.0)
@@ -137,7 +152,9 @@ def yuv_to_rgb_triton(
     b, t, _ = video.shape
     h, w = window
     coef = torch.tensor(
-        [COEFFICIENTS[c] for c in colorspace], dtype=torch.float32, device=video.device
+        [color_coefficients(c) for c in colorspace],
+        dtype=torch.float32,
+        device=video.device,
     )
     coef = coef.repeat_interleave(t, 0)
     flips = flips.to(video.device, torch.int8).repeat_interleave(t, 0)
