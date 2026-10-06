@@ -224,8 +224,8 @@ fn input_frame(planes: &Planes, format: i32, limited: bool) -> Result<AVFrame, S
             .iter()
             .zip(&g[source.clone()])
             .zip(&b[source]);
-        for (out, ((&r, &g), &b)) in row.chunks_exact_mut(3).zip(pixels) {
-            out.copy_from_slice(&[r, g, b]);
+        for (out, ((&r, &g), &b)) in row.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+            *out = [r, g, b];
         }
     }
     Ok(frame)

@@ -160,7 +160,7 @@ fn to_rgb_planes<'a>(frame: &AVFrame, buffer: &'a mut Vec<u8>) -> Result<Picture
             .iter_mut()
             .zip(g[out.clone()].iter_mut())
             .zip(b[out].iter_mut());
-        for (pixel, ((r, g), b)) in row.chunks_exact(4).zip(outputs) {
+        for (pixel, ((r, g), b)) in row.as_chunks::<4>().0.iter().zip(outputs) {
             let alpha = pixel[3] as u32;
             // c * a + white * (1 - a), rounded
             let over_white = |c: u8| ((c as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
