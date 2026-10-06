@@ -77,11 +77,12 @@ pin-memory thread also copies each batch once more in the main process). Pinned 
 ~52 GB/s against ~13 GB/s from pageable memory, and torch's caching host allocator hands out a
 pinned buffer in ~3 us, so decoding each batch into a fresh pinned tensor is the cheap path.
 
-In Foliation's pretraining (TT3D-B/16 + DiT-S, 2 x B300, 16 clips per GPU) every setup trains at
-the same speed within the run-to-run spread (about +-0.1 it/s over 3 interleaved rounds of 500
-steps): tar of JPEG with 16 DataLoader workers 7.10 it/s, KohakuClip in process (8 threads)
-7.13, 2 workers x 8 threads 6.99, 4 workers x 4 threads 7.07. A profile of that loop shows the
-GPU busy for the whole step, so the loader is not on the critical path at 115 clips/s per GPU.
+In a video pretraining run (a B/16 video encoder + a DiT-S decoder, 2 x B300, 16 clips per GPU)
+every setup trains at the same speed within the run-to-run spread (about +-0.1 it/s over 3
+interleaved rounds of 500 steps): tar of JPEG with 16 DataLoader workers 7.10 it/s, KohakuClip in
+process (8 threads) 7.13, 2 workers x 8 threads 6.99, 4 workers x 4 threads 7.07. A profile of that
+loop shows the GPU busy for the whole step, so the loader is not on the critical path at 115 clips/s
+per GPU.
 
 Memory (`benchmarks/leak_check.py`, anonymous resident memory): flat over 1500 yuv batches and
 100 encode + pack rounds; rgb reading grows during warm-up (per-thread buffers and decoders)
