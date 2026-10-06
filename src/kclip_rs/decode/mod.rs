@@ -1,8 +1,10 @@
-//! Decoding a planned clip: one pread per GOP, a persistent decoder per thread, then the output
-//! pixels of each wanted frame.
+//! Decoding a planned clip (one pread per GOP, a persistent decoder per thread, then the output
+//! pixels of each wanted frame) or a planned image.
 
 mod decoder;
 mod emit;
+mod frame;
+mod image;
 pub mod profile;
 
 use std::os::unix::fs::FileExt;
@@ -12,11 +14,32 @@ use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
+use crate::image::Grid;
 use crate::read::plan::ClipPlan;
 use crate::storage::index::Codec;
 use decoder::{DECODERS, open_decoder, to_annexb};
-use emit::{colorspace_name, emit};
+pub use emit::{Output, emit};
+pub use frame::{colorspace_name, picture};
+pub use image::decode_image;
 use profile::{DECODED, EMITTED, Stage, timed};
+
+/// Where a clip's output pixels come from: its planned geometry as an output grid.
+fn clip_output(plan: &ClipPlan) -> Output {
+    let g = plan.geometry;
+    Output {
+        grid: Grid {
+            nh: g.nh as f64,
+            nw: g.nw as f64,
+            top: g.top as f64,
+            left: g.left as f64,
+            oh: g.oh as usize,
+            ow: g.ow as usize,
+        },
+        hflip: g.hflip,
+        vflip: g.vflip,
+        mode: plan.mode,
+    }
+}
 
 /// Decode `plan` into `out` (all of the clip's output slots).
 pub fn decode_clip(plan: &ClipPlan, out: &mut [u8]) -> Result<(), String> {
@@ -59,12 +82,12 @@ pub fn decode_clip(plan: &ClipPlan, out: &mut [u8]) -> Result<(), String> {
                 }
                 timed(Stage::Decode, || context.send_packet(Some(&d.packet)))
                     .map_err(|e| format!("decode: {e}"))?;
-                emitted += drain(context, &mut d.frame, plan, out, slot_len, &mut d.planes)?;
+                emitted += drain(context, &mut d.frame, plan, out, slot_len, &mut d.buffers)?;
             }
             // flush the group's last frames
             timed(Stage::Decode, || context.send_packet(None))
                 .map_err(|e| format!("decode: {e}"))?;
-            emitted += drain(context, &mut d.frame, plan, out, slot_len, &mut d.planes)?;
+            emitted += drain(context, &mut d.frame, plan, out, slot_len, &mut d.buffers)?;
         }
 
         let wanted = plan.wanted();
@@ -82,8 +105,9 @@ fn drain(
     plan: &ClipPlan,
     out: &mut [u8],
     slot_len: usize,
-    planes: &mut Vec<u8>,
+    buffers: &mut (Vec<u8>, Vec<u8>),
 ) -> Result<usize, String> {
+    let output = clip_output(plan);
     let mut emitted = 0;
     loop {
         // SAFETY: both are valid; receive_frame unreferences `frame` before filling it
@@ -103,12 +127,10 @@ fn drain(
             }
             match first {
                 None => {
-                    emit(
-                        plan,
-                        frame,
-                        &mut out[slot * slot_len..(slot + 1) * slot_len],
-                        planes,
-                    )?;
+                    let (pixels, scratch) = buffers;
+                    let decoded = picture(frame, pixels)?;
+                    let dst = &mut out[slot * slot_len..(slot + 1) * slot_len];
+                    emit(&decoded, &output, dst, scratch)?;
                     first = Some(slot);
                 }
                 Some(source) => {

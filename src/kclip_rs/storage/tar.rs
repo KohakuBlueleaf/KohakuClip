@@ -18,10 +18,11 @@ pub fn list(path: &Path) -> io::Result<Listing> {
         }
         let name = entry.path()?.to_string_lossy().into_owned();
         let offset = entry.raw_file_position();
+        let size = entry.size();
         if name == INDEX_NAME {
             index = Some(offset);
         } else {
-            members.push(Member::at(name, path.to_path_buf(), offset));
+            members.push(Member::at(name, path.to_path_buf(), offset, size));
         }
     }
     Ok(Listing { members, index })

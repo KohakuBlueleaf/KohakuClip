@@ -32,8 +32,14 @@ fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
-/// Read the central directory (zip64 aware); member data offsets are resolved lazily.
-pub fn list(path: &Path, file: &File) -> io::Result<Listing> {
+/// Where the central directory is: member count, size and offset (zip64 aware).
+struct CentralDirectory {
+    count: u64,
+    size: u64,
+    offset: u64,
+}
+
+fn central_directory(file: &File) -> io::Result<CentralDirectory> {
     let len = file.metadata()?.len();
     let tail_len = len.min(22 + 65535 + 20);
     let mut tail = vec![0u8; tail_len as usize];
@@ -43,19 +49,58 @@ pub fn list(path: &Path, file: &File) -> io::Result<Listing> {
         .find(|&i| u32_at(&tail, i) == EOCD)
         .ok_or_else(|| bad("not a zip or tar archive"))?;
 
-    let mut count = u16_at(&tail, eocd + 10) as u64;
-    let mut cd_size = u32_at(&tail, eocd + 12) as u64;
-    let mut cd_offset = u32_at(&tail, eocd + 16) as u64;
     if eocd >= 20 && u32_at(&tail, eocd - 20) == EOCD64_LOCATOR {
         let mut record = [0u8; 56];
         file.read_exact_at(&mut record, u64_at(&tail, eocd - 20 + 8))?;
         if u32_at(&record, 0) != EOCD64 {
             return Err(bad("bad zip64 end of central directory"));
         }
-        count = u64_at(&record, 32);
-        cd_size = u64_at(&record, 40);
-        cd_offset = u64_at(&record, 48);
+        return Ok(CentralDirectory {
+            count: u64_at(&record, 32),
+            size: u64_at(&record, 40),
+            offset: u64_at(&record, 48),
+        });
     }
+    Ok(CentralDirectory {
+        count: u16_at(&tail, eocd + 10) as u64,
+        size: u32_at(&tail, eocd + 12) as u64,
+        offset: u32_at(&tail, eocd + 16) as u64,
+    })
+}
+
+/// The data offset of member `name` when it is the archive's last member (where KohakuClip's
+/// writers put the index), found from the end of the central directory alone: opening a shard
+/// does not read its whole directory. None when the last member is something else.
+pub fn find_last(file: &File, name: &str) -> io::Result<Option<u64>> {
+    let cd = central_directory(file)?;
+    // the entry is 46 bytes + the name, + a 12-byte zip64 extra field past 4 GiB
+    for extra_len in [0u64, 12] {
+        let entry_len = 46 + name.len() as u64 + extra_len;
+        if entry_len > cd.size {
+            continue;
+        }
+        let mut entry = vec![0u8; entry_len as usize];
+        file.read_exact_at(&mut entry, cd.offset + cd.size - entry_len)?;
+        let matches = u32_at(&entry, 0) == CENTRAL
+            && u16_at(&entry, 28) as usize == name.len()
+            && u16_at(&entry, 30) as u64 == extra_len
+            && u16_at(&entry, 32) == 0
+            && &entry[46..46 + name.len()] == name.as_bytes();
+        if matches {
+            let header = zip64_header_offset(&entry, &entry[46 + name.len()..]);
+            return Ok(Some(data_offset(file, header)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Read the central directory (zip64 aware); member data offsets are resolved lazily.
+pub fn list(path: &Path, file: &File) -> io::Result<Listing> {
+    let CentralDirectory {
+        count,
+        size: cd_size,
+        offset: cd_offset,
+    } = central_directory(file)?;
 
     let mut cd = vec![0u8; cd_size as usize];
     file.read_exact_at(&mut cd, cd_offset)?;
@@ -73,19 +118,23 @@ pub fn list(path: &Path, file: &File) -> io::Result<Listing> {
         let name = String::from_utf8_lossy(&cd[at + 46..at + 46 + name_len]).into_owned();
         let extra = &cd[at + 46 + name_len..at + 46 + name_len + extra_len];
         let header = zip64_header_offset(&cd[at..], extra);
+        let entry = at;
         at += 46 + name_len + extra_len + comment_len;
 
         if name.ends_with('/') {
             continue;
         }
-        if method != 0 {
+        // stored, or deflated (images: inflated after the read)
+        if method != 0 && method != 8 {
             return Err(bad(&format!(
-                "{name}: compressed zip member (store mp4 files)"
+                "{name}: zip member compressed with method {method} (stored or deflated only)"
             )));
         }
         let member = Member {
             name,
             path: path.to_path_buf(),
+            size: zip64_size(&cd[entry..], extra),
+            deflated: method == 8,
             location: Location::ZipLocalHeader(header),
             data: OnceLock::new(),
         };
@@ -96,6 +145,30 @@ pub fn list(path: &Path, file: &File) -> io::Result<Listing> {
         }
     }
     Ok(Listing { members, index })
+}
+
+/// The (stored) size of a central directory entry's member (from the zip64 extra field if
+/// needed).
+fn zip64_size(entry: &[u8], extra: &[u8]) -> u64 {
+    let size = u32_at(entry, 20);
+    if size != u32::MAX {
+        return size as u64;
+    }
+    // zip64 extra: the uncompressed size first (if saturated), then the compressed size
+    let mut i = 0;
+    while i + 4 <= extra.len() {
+        let id = u16_at(extra, i);
+        let len = u16_at(extra, i + 2) as usize;
+        if id == ZIP64_EXTRA {
+            let mut field = i + 4;
+            if u32_at(entry, 24) == u32::MAX {
+                field += 8;
+            }
+            return u64_at(extra, field);
+        }
+        i += 4 + len;
+    }
+    size as u64
 }
 
 /// The local header offset of a central directory entry (from the zip64 extra field if needed).

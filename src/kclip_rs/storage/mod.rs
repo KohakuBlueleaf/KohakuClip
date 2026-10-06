@@ -2,6 +2,8 @@
 //! index, and shards themselves.
 
 mod folder;
+pub mod image_index;
+pub mod image_shard;
 pub mod index;
 pub mod shard;
 pub mod tar;
@@ -17,6 +19,10 @@ pub struct Member {
     pub name: String,
     /// The file holding the bytes: the archive, or the mp4 itself.
     pub path: PathBuf,
+    /// Bytes of the member (as stored: compressed for a deflated zip member).
+    pub size: u64,
+    /// A deflated zip member (images only: videos must be stored).
+    pub deflated: bool,
     location: Location,
     data: OnceLock<u64>,
 }
@@ -29,10 +35,12 @@ enum Location {
 }
 
 impl Member {
-    fn at(name: String, path: PathBuf, offset: u64) -> Self {
+    fn at(name: String, path: PathBuf, offset: u64, size: u64) -> Self {
         Self {
             name,
             path,
+            size,
+            deflated: false,
             location: Location::At(offset),
             data: OnceLock::new(),
         }
@@ -57,18 +65,39 @@ pub struct Listing {
     pub index: Option<u64>,
 }
 
+/// The members of a zip / tar archive, or every `*.mp4` below a folder. Videos are read in
+/// place: a deflated mp4 member is an error.
 pub fn list(path: &Path) -> io::Result<Listing> {
-    if path.is_dir() {
-        return Ok(folder::list(path));
+    let listing = list_files(path, |name| name.ends_with(".mp4"))?;
+    if let Some(member) = listing
+        .members
+        .iter()
+        .find(|m| m.deflated && m.name.ends_with(".mp4"))
+    {
+        let msg = format!("{}: compressed zip member (store mp4 files)", member.name);
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
-    let mut magic = [0u8; 262];
-    let mut file = File::open(path)?;
-    let n = file.read(&mut magic)?;
-    if n >= 262 && &magic[257..262] == b"ustar" {
+    Ok(listing)
+}
+
+/// The members of a zip / tar archive (all of them), or the files below a folder whose names
+/// `keep` accepts.
+pub fn list_files(path: &Path, keep: fn(&str) -> bool) -> io::Result<Listing> {
+    if path.is_dir() {
+        return Ok(folder::list(path, keep));
+    }
+    if is_tar(path)? {
         tar::list(path)
     } else {
-        zip::list(path, &file)
+        zip::list(path, &File::open(path)?)
     }
+}
+
+/// Whether the file at `path` is a tar archive (the ustar magic).
+pub fn is_tar(path: &Path) -> io::Result<bool> {
+    let mut magic = [0u8; 262];
+    let n = File::open(path)?.read(&mut magic)?;
+    Ok(n >= 262 && &magic[257..262] == b"ustar")
 }
 
 /// A writer that knows how many bytes went through it.
