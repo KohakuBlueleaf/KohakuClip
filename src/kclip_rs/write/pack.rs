@@ -1,10 +1,13 @@
-//! Packing mp4 files into a shard with its index.
+//! Packing mp4 files or images into a shard with its index.
 
 use std::path::Path;
 
 use super::av1;
+use crate::codec::ImageCodec;
 use crate::decode;
 use crate::mp4;
+use crate::storage::image_index::{self, ImageRecord};
+use crate::storage::image_shard::default_color;
 use crate::storage::index::{self, Codec, Frame, INDEX_NAME, VideoMeta};
 use crate::storage::tar::TarWriter;
 use crate::storage::zip::ZipWriter;
@@ -64,6 +67,57 @@ pub fn pack(path: &Path, members: &[(String, Vec<u8>)]) -> Result<(), String> {
             tables.push(frames);
         }
         zip.add(INDEX_NAME, &index::build(&mut videos, &tables))
+            .map_err(io)?;
+        zip.finish().map_err(io)
+    }
+}
+
+/// One stored image to pack: member name, bytes, stored size, codec.
+pub struct ImageMember {
+    pub name: String,
+    pub data: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub codec: ImageCodec,
+}
+
+/// Pack images into a `.tar` or (otherwise) stored `.zip` shard, then append the image index
+/// as the last member (`header`: a json object of shard-level facts; the image count is added).
+pub fn pack_images(
+    path: &Path,
+    members: &[ImageMember],
+    header: serde_json::Value,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut header = match header {
+        serde_json::Value::Object(map) => map,
+        _ => return Err("the index header must be a json object".into()),
+    };
+    header.insert("images".into(), members.len().into());
+    let header = serde_json::Value::Object(header);
+
+    let record = |m: &ImageMember, offset: u64| {
+        let size = u32::try_from(m.data.len()).map_err(|_| format!("{}: over 4 GiB", m.name))?;
+        let color = default_color(m.codec);
+        Ok::<_, String>(ImageRecord::new(offset, size, m.w, m.h, m.codec, color))
+    };
+    let mut records = Vec::with_capacity(members.len());
+    if path.extension().is_some_and(|ext| ext == "tar") {
+        let mut tar = TarWriter::create(path).map_err(io)?;
+        for m in members {
+            let offset = tar.add(&m.name, &m.data).map_err(io)?;
+            records.push(record(m, offset)?);
+        }
+        tar.add(INDEX_NAME, &image_index::build(&header, &records))
+            .map_err(io)?;
+        tar.finish().map_err(io)
+    } else {
+        let mut zip = ZipWriter::create(path).map_err(io)?;
+        for m in members {
+            let offset = zip.add(&m.name, &m.data).map_err(io)?;
+            records.push(record(m, offset)?);
+        }
+        zip.add(INDEX_NAME, &image_index::build(&header, &records))
             .map_err(io)?;
         zip.finish().map_err(io)
     }

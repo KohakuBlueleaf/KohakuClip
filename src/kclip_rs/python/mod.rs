@@ -16,5 +16,5 @@ mod _core {
     #[pymodule_export]
     use super::reader::{Batch, Reader, VideoInfo, profile};
     #[pymodule_export]
-    use super::writer::{py_encode, py_pack};
+    use super::writer::{py_encode, py_encode_image, py_pack, py_pack_images};
 }

@@ -1,11 +1,13 @@
 //! Writing shards: re-encode any video (a file or bytes in memory) to the storage format with the
-//! linked FFmpeg libraries, then pack mp4 files into a zip / tar shard with its index.
+//! linked FFmpeg libraries, then pack mp4 files into a zip / tar shard with its index; or encode
+//! images (`image`) and pack them with an image index.
 //!
 //! Storage format (defaults): native fps, short side capped at 512 (never upscaled), closed GOPs
 //! of 16, AV1 (SVT-AV1) with the in-loop filters off for faster decoding, faststart mp4.
 
 mod av1;
 mod encode;
+mod image;
 mod memio;
 mod pack;
 
@@ -17,7 +19,8 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
 pub use encode::{Source, encode};
-pub use pack::pack;
+pub use image::{ImageEncoding, JpegEncoder, Outcome, encode_image};
+pub use pack::{ImageMember, pack, pack_images};
 
 /// How videos are stored.
 #[derive(Clone, Debug)]

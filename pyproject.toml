@@ -21,10 +21,12 @@ classifiers = [
 
 [project.optional-dependencies]
 torch = ["torch>=2.3", "triton>=3"]
-test = ["pytest>=8", "av>=14", "torch>=2.3"]
+test = ["pytest>=8", "av>=14", "torch>=2.3", "pillow>=10"]
+pillow = ["pillow>=10"]
 
 [project.scripts]
 kohakuclip-write = "kohakuclip.writer:main"
+kohakuclip-write-images = "kohakuclip.image_writer:main"
 
 [tool.maturin]
 python-source = "src"
