@@ -1,9 +1,11 @@
 # KohakuClip
 
-Fast random-access video clips for training. Videos are stored as mp4 files (AV1, H.264 or HEVC)
-in zip or tar shards with an in-archive frame index, or read straight from folders and archives of
-mp4 files. Each batch of clips is planned and decoded natively (Rust, on the system's FFmpeg
-libraries) on a persistent thread pool, straight into a (pinned) uint8 buffer, without the GIL.
+Fast random-access video clips and images for training. Videos are stored as mp4 files (AV1,
+H.264 or HEVC) in zip or tar shards with an in-archive frame index, or read straight from folders
+and archives of mp4 files. Each batch of clips is planned and decoded natively (Rust, on the
+system's FFmpeg libraries) on a persistent thread pool, straight into a (pinned) uint8 buffer,
+without the GIL. Images work the same way ([Images](#images)): JPEG shards with a fixed-size
+index, written with mozjpeg and decoded by libjpeg-turbo.
 
 ```python
 from kohakuclip import Reader
@@ -173,6 +175,102 @@ read per GOP): 3.24 ms at 8 @ 6 fps, 6.56 for 8 random frames (more GOPs per cli
 | index vs moov fallback | within ~3 % |
 | this core vs the previous C++ one (same plan, both `-march=native`) | 8 @ 6 fps 3.85 -> 3.23, 8 @ 24 fps 2.25 -> 1.84 |
 
+## Images
+
+```python
+from kohakuclip import ImageReader
+
+reader = ImageReader(["data/images/shard_00000.zip"], size=256, threads=16, hflip=0.5)
+images = reader.read(reader.sample(256)).image  # uint8 [256, 3, 256, 256]
+```
+
+```bash
+# mozjpeg 4:4:4 q70, short side <= 512
+kohakuclip-write-images out_dir images/ webdataset.tar photo.png
+```
+
+`ImageReader` mirrors `Reader`: `sample(n, seed)` draws image ids, `submit(ids, out, seed)` /
+`read(...)` decode a batch on the native pool (no GIL), `info(id)` gives the stored size, codec
+and member name. Crops: `"random"` / `"center"` (short side resized to `size`, then a square, as
+for clips) or `"resized"` (RandomResizedCrop with `scale` and `ratio`); flips; the `rgb`, `yuv`
+and `yuv_resized` modes (`yuv_to_rgb` takes image batches too; JPEG is full-range BT.601,
+reported as `"bt601-full"`). `kohakuclip.torch.ImageDataset` is the `ClipDataset` of images
+(same batches for any worker count, exact resumption through `ClipLoader`, rank-aware, epoch
+mode over a seeded permutation evaluated per batch, `kohakuclip.permute`, so epochs over tens of
+millions of images need no O(n) table).
+
+Storage: images in stored zip shards, `<key>.jpg` members and an index member (`__index__.bin`,
+the last member, found from the end of the central directory without listing the archive): per
+image 24 bytes (absolute offset, size, stored width and height, codec, color), memory-mapped, no
+per-image allocation (a reader over 55M images costs no more memory than the pages it touches).
+Captions and other metadata go to the writer's `manifest.parquet` (shard, index in the shard,
+key, stored and source sizes, `native_res`, caption, the json sidecar). Plain sources work too,
+through the same decode / resize / crop path: zip archives of images (stored or deflated
+members), tar archives and folders (listed; sizes from each image's header).
+
+Writer: any input FFmpeg or libjpeg-turbo reads (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF, JPEG XL;
+files, folders with `<stem>.txt` / `<stem>.json` sidecars, WebDataset tars), decoded natively
+(JPEG through libjpeg-turbo, others through FFmpeg, alpha composited onto white), EXIF
+orientation applied, short side capped at 512 with Lanczos-3 (never upscaled), images under 384
+dropped (`skipped.jsonl`; `min_short=0` keeps every image), encoded with mozjpeg (trellis
+quantization, baseline scans, built in) one image per thread without the GIL. Inputs the native
+path cannot read (e.g. CMYK JPEGs) are decoded by Pillow and encoded natively; `--backend
+pillow` uses Pillow for all. `--jpeg-encoder turbo` encodes with libjpeg-turbo instead (~8x
+faster, 5-8 % larger). Other storage codecs: `--codec av1` (libaom, intra, raw OBUs), `jxl`,
+`webp` (through FFmpeg; read back through libdav1d, libjxl and libwebp directly). From Python:
+`kohakuclip.image_writer.write_images`, or `kohakuclip._core.encode_image` / `pack_images`.
+
+### Storage format (measured)
+
+3000 images (1500 cc12m, 1500 LAION-COCO originals) stored at short side 512 (native when
+smaller); quality = PSNR of 256 x 256 random resized crops (area 0.2-1) against the same crop of
+the original; every codec's own library called directly at its best still-image settings (a
+grid of 705 settings: libavif 1.4.2 with libaom 3.15.1 and SVT-AV1 4.2.0, mozjpeg 4.1.1,
+libjpeg-turbo 3.2, libwebp 1.6, libjxl 0.12), each family interpolated to the same quality.
+Decoding: CPU only, every format through this reader's path (its own library to native planes,
+the resize fused with the crop to 256, RGB), single-threaded decoders checked against the
+libraries' own tools (dav1d, djxl, tjbench, `WebPDecodeYUVInto`); one core, and 64 processes on
+64 CPUs (32 cores x 2 hyperthreads) of a Xeon 6747P:
+
+| storage, at 43 dB | KB / image | images/s, 1 core | images/s, 64 CPUs | encode ms / image |
+|---|---|---|---|---|
+| AVIF 4:4:4 (aom speed 6, tune ssimulacra2) | 35.3 | 220 | 10,700 | 158 |
+| AVIF 4:2:0 (SVT-AV1 preset 8, tune iq) | 48.3 | 221 | 10,700 | 20 |
+| **JPEG 4:4:4, mozjpeg baseline** (DCT shrink) | **50.3** | **1,088** | **45,700** | **21** |
+| JPEG 4:4:4, libjpeg-turbo baseline (DCT shrink) | 53.1 | 1,071 | 45,200 | 2.7 |
+| JPEG 4:4:4, mozjpeg progressive (DCT shrink) | 48.8 | 557 | 24,900 | 33 |
+| WebP (method 6, sharp YUV) | 50.2 | 298 | 14,800 | 77 |
+| JPEG XL (effort 7, decoding speed 4) | 54.3 | 194 | 8,800 | 70 |
+| JPEG 4:2:0, libjpeg-turbo baseline (DCT shrink) | 66.3 | 1,116 | 49,900 | 2.2 |
+
+AVIF 4:4:4 is 27-35 % smaller than JPEG at the same quality and decodes 4x slower; WebP and JPEG
+XL are larger than AVIF and slower than JPEG; progressive JPEG decodes at half the speed of
+baseline. The writer's default, mozjpeg 4:4:4 baseline quality 70, lands at 41.3 dB on these
+crops at 43 KB per image, through this writer from the originals (588 of 600 images: the
+transparent PNGs, composited onto white here, have no comparable reference).
+
+### Reading speed
+
+mozjpeg 4:4:4 q70 shard (3000 images), 256 x 256 rgb output, batches of 256, 64 CPUs (32 cores
+x 2 threads) of a Xeon 6747P, the shard in the page cache:
+
+| crop | ms / image, 1 thread | 16 threads | 32 threads | 64 threads |
+|---|---|---|---|---|
+| random (short side to 256): DCT shrink 1/2 | 0.89 | 12,800 / s | 26,000 / s | 42,700 / s |
+| same, no DCT shrinking (`dct_scale=False`) | 1.38 | 8,500 / s | 18,700 / s | 29,600 / s |
+| resized (area 0.08-1) | 1.22 | 8,800 / s | 19,000 / s | 30,200 / s |
+
+Per image on one thread (random crop): decode 0.74 ms, resize 0.08, convert 0.06, read 0.01.
+Baseline on the same bytes (from memory, no file reads): Pillow (`draft`, resize, crop) 1.22 ms
+/ image / core, 32,600 / s on 64 processes. As loaders (decode threads vs DataLoader workers
+over a zip + Pillow dataset): `ImageDataset` 26,700 / s with 32 threads, the DataLoader 14,800 /
+s with 32 workers.
+
+DCT shrinking reads the JPEG at half resolution when the output allows it: the outputs differ
+from full decoding + the resize at ~40 dB PSNR (a sharper low-pass); `dct_scale=False` gives the
+resize's filter alone. 4:4:4 JPEGs read at their stored size are libjpeg's decode + the
+conversion, bit for bit (tests).
+
 ## Install and build
 
 ```bash
@@ -181,14 +279,17 @@ pip install kohakuclip
 
 The wheels (manylinux_2_35: glibc 2.35+, e.g. Ubuntu 22.04 or newer; x86-64-v3; Python 3.13
 / 3.14) bundle an LGPL FFmpeg 8.1 from conda-forge with libdav1d (AV1 decoding), SVT-AV1 and
-aom (AV1 encoding) and openh264; they need nothing else installed. That build has no x264 / x265, so `--codec h264` / `hevc`
-needs a source build against an FFmpeg that has them, or `--backend ffmpeg`.
+aom (AV1 encoding) and openh264, libjpeg-turbo (images) and mozjpeg (built in); they need
+nothing else installed. That build has no x264 / x265, so `--codec h264` / `hevc` needs a source
+build against an FFmpeg that has them, or `--backend ffmpeg`.
 
-To build against your own FFmpeg (libavcodec, libavformat, libswscale, libavutil; with
-libdav1d for AV1 decoding and libsvtav1 for AV1 encoding), e.g. conda-forge / micromamba
-(`micromamba install ffmpeg "libclang=18" "clang=18"`) or the distro's. The Rust bindings
-are generated at build time by bindgen, with libclang 18 (newer versions generate broken FFmpeg
-bindings with this bindgen) and clang's own headers:
+To build against your own FFmpeg (libavcodec, libavformat, libswscale, libavutil; with libdav1d for
+AV1 decoding and libsvtav1 for AV1 encoding), libjpeg-turbo >= 3.0 (TurboJPEG API), libdav1d, libjxl
+and libwebp (in the same library directory), e.g. conda-forge / micromamba (`micromamba install
+ffmpeg "libjpeg-turbo=3" dav1d-devel "libclang=18" "clang=18"`) or the distro's, and `nasm` on PATH
+(mozjpeg is compiled in by `mozjpeg-sys`, without its SIMD code when nasm is missing). The Rust
+bindings are generated at build time by bindgen, with libclang 18 (newer versions generate broken
+FFmpeg bindings with this bindgen) and clang's own headers:
 
 ```bash
 export FFMPEG_INCLUDE_DIR=$CONDA_PREFIX/include FFMPEG_LIBS_DIR=$CONDA_PREFIX/lib
@@ -208,22 +309,34 @@ weekly. The version lives in `pyproject.toml` (`scripts/ci/version.py`).
 
 ## Code
 
-- `src/kclip_rs/` (Rust): `storage/` (zip / tar / folder listing and writing, the index, shards),
-  `mp4/` (moov parsing, decoder configuration, faststart), `read/` (planning, sampling, the thread
-  pool), `decode/` (decoding a planned clip), `image/` (resize, conversion, SIMD kernels),
-  `write/` (encoding with FFmpeg, AV1 dependency parsing, packing), `python/` (the
-  `kohakuclip._core` module).
-- `src/kohakuclip/` (Python): the package, `torch.py` (`ClipDataset`, `ClipLoader`,
-  `yuv_to_rgb`), `gpu.py` (the Triton kernel), `writer.py` (sources, the ffmpeg command-line
-  backend, the CLI).
+- `src/kclip_rs/` (Rust): `storage/` (zip / tar / folder listing and writing, the video and image
+  indexes, shards), `mp4/` (moov parsing, decoder configuration, faststart), `codec/` (JPEG
+  through libjpeg-turbo and mozjpeg, AV1 through libdav1d, JPEG XL through libjxl, WebP through
+  libwebp, PNG through FFmpeg), `read/` (planning clips and images, sampling, epoch
+  permutations, the thread pool), `decode/` (decoding a planned clip or image, output pixels per
+  mode), `image/` (pictures, resize, conversion, SIMD kernels), `write/` (encoding videos with
+  FFmpeg, AV1 dependency parsing, encoding images, packing), `python/` (the `kohakuclip._core`
+  module).
+- `src/kohakuclip/` (Python): the package, `torch.py` (`ClipDataset`, `ImageDataset`,
+  `ClipLoader`, `yuv_to_rgb`), `gpu.py` (the Triton kernel), `writer.py` (video sources, the
+  ffmpeg command-line backend, the CLI), `image_writer.py` (image sources, the Pillow backend,
+  manifests, the CLI).
 - `examples/`: a plain PyTorch loop and a Lightning module. `benchmarks/`: reader speed
-  (`bench.py`), the PyTorch side (`loader_bench.py`), the GPU side (`gpu_check.py`), memory
-  (`leak_check.py`).
+  (`bench.py`, images: `image_bench.py` with Pillow / torchvision / DataLoader baselines), the
+  PyTorch side (`loader_bench.py`), the GPU side (`gpu_check.py`), memory (`leak_check.py`).
 
 Tests (`pytest tests`) write AV1 and H.264 shards from synthetic videos (native and command-line
 encoders) and compare the reader with a PyAV + torch reference; zip / tar / folder sources with
 the index and the moov fallback with each other; skipping with full decoding; tar and in-memory
 inputs with files; the yuv modes with rgb; `ClipDataset` batches across worker counts and after
-resuming. `cargo test` checks the SIMD kernels against the plain
-code. Rust is formatted with rustfmt and checked with clippy; Python is formatted with black and
+resuming; encoder errors and failed batches. Images: shards written from synthetic images
+(folders with captions, WebDataset tars, EXIF-rotated, transparent, gray and CMYK inputs) against
+a Pillow + torch reference; mozjpeg output (baseline, 4:4:4, smaller than libjpeg-turbo's)
+decoded bit for bit against libjpeg's own decode; indexed zip / listed zip / tar / folder sources
+with each other, and plain tars, zips (stored and deflated) and folders of JPEGs; odd-sized 4:2:0
+chroma alignment (reader and writer); DCT shrinking, augmentations, the yuv modes, AV1 / JPEG XL /
+WebP storage, the Pillow backend, `ImageDataset` across worker counts, resumption and epochs.
+`cargo test` checks the SIMD kernels against the plain code, the Lanczos filter, the EXIF and
+orientation handling, the permutation and the crop geometry.
+Rust is formatted with rustfmt and checked with clippy; Python is formatted with black and
 checked with ruff and mypy.

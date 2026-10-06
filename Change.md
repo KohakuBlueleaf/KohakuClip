@@ -1,5 +1,40 @@
 # Change Log
 
+## (unreleased) update to 1.1.0
+
+### Highlights
+
+Images: JPEG shards written with mozjpeg (4:4:4, baseline, quality 70 by default: 41-42 dB PSNR
+on 256 x 256 random resized crops at ~43 KB per image, chosen from a measured study of
+optimized JPEG / AVIF / WebP / JPEG XL encoders) with a fixed-size memory-mapped index, read
+natively without the GIL at ~0.9 ms per 256 x 256 image per core (42.7k images/s on 64 CPUs of
+a Xeon 6747P), plus plain tars, zips and folders of images, and an image writer for any input
+format.
+
+### Full change log
+
+#### New Features
+
+* **Images**: `ImageReader` (rgb / yuv / yuv_resized, short-side or random resized crops, flips,
+  DCT shrinking, kernel readahead; indexed shards, or plain zips (stored or deflated members),
+  tars and folders), `ImageDataset` (the `ClipDataset` of images; epochs over a seeded
+  permutation, `permute`), `encode_image` / `pack_images` and `kohakuclip-write-images` (files,
+  folders with caption sidecars, WebDataset tars; EXIF orientation, alpha onto white, Lanczos-3
+  downscaling, Pillow fallback; manifest.parquet with `native_res`). JPEGs are encoded by
+  mozjpeg (built in; `jpeg_encoder="turbo"` for libjpeg-turbo). AV1 (intra), JPEG XL and WebP
+  storage selectable, each read through its own library directly (libdav1d, libjxl, libwebp;
+  single-threaded, native planes into the same resize and conversion as JPEG); PNG through
+  FFmpeg.
+* `yuv_to_rgb` (Triton and torch) handles full-range colorspaces ("bt601-full") and image
+  batches.
+
+#### Fixes
+
+* Encoding a source tagged with the RGB (identity) matrix on YUV content crashed (rsmpeg frees
+  the encoder options twice when an encoder fails to open): encoder open errors now raise, and
+  such sources are encoded as untagged.
+* Dropping a `Pending` whose `result()` raised no longer panics.
+
 ## 2026/10/01 update to 1.0.0
 
 ### Highlights
